@@ -10,6 +10,57 @@ def parse_query(query):
     return re.sub(r"\s+", " ", query).strip().strip(".").strip()
 
 
+ALLOW_MISSING_VIDEOS_ENV = "TIMELENS_ALLOW_MISSING_VIDEOS"
+
+
+def check_videos_present(video_paths, dataset_name, video_root):
+    """Fail loudly when annotated videos are not on disk. Returns the set of missing paths.
+
+    Why this exists. Every loader in this file used to carry a COMMENTED-OUT existence check, so a
+    loader pointed at annotations whose videos were absent yielded unloadable paths and reported
+    nothing. That is exactly how NS-P2 issue #81 came to record "corpus is on disk" for
+    TimeLens-100K when only its 19,466-record jsonl was present: the claim was never contradicted
+    by anything the loader did. A run would then die at the first decord read -- or worse, survive
+    on a partial epoch and produce a clean loss curve and a meaningless verdict.
+
+    Behaviour. Missing files raise FileNotFoundError with the COUNT and the first ten paths, after
+    the whole manifest is checked -- a count is diagnostic where a first-missing-path is not
+    ("2 of 19,466 missing" and "19,466 of 19,466 missing" are different problems). Setting
+    TIMELENS_ALLOW_MISSING_VIDEOS=1 downgrades that to dropping the missing records, and it still
+    prints what it dropped. There is deliberately no mode in which missing videos pass unremarked.
+
+    `video_paths` is checked once per unique video, not once per query, so the stat cost is one per
+    file even on corpora with ~5 queries each.
+    """
+    unique = sorted(set(video_paths))
+    missing = {p for p in unique if not os.path.exists(p)}
+    if not missing:
+        return missing
+
+    shown = sorted(missing)[:10]
+    detail = "\n  ".join(shown)
+    if len(missing) > len(shown):
+        detail += "\n  ... and %d more" % (len(missing) - len(shown))
+    msg = (
+        "%s: %d of %d annotated videos are missing under VIDEO_ROOT=%r.\n"
+        "The annotations are present but the video corpus is not (or not fully) on disk, so these "
+        "records would yield unloadable paths.\n  %s"
+        % (dataset_name, len(missing), len(unique), video_root, detail)
+    )
+    if os.environ.get(ALLOW_MISSING_VIDEOS_ENV) == "1":
+        print(
+            "WARNING: %s\nWARNING: %s=1 -- dropping those %d videos from this split."
+            % (msg, ALLOW_MISSING_VIDEOS_ENV, len(missing)),
+            flush=True,
+        )
+        return missing
+    raise FileNotFoundError(
+        msg
+        + "\nSet %s=1 to drop the missing records instead of failing; it prints what it drops."
+        % ALLOW_MISSING_VIDEOS_ENV
+    )
+
+
 class ActivitynetTimeLensDataset:
     ANNO_PATH_TEST = "data/TimeLens-Bench/activitynet-timelens.json"
     VIDEO_ROOT = "data/TimeLens-Bench/videos/activitynet"
@@ -78,23 +129,41 @@ class Ego4DNLQDataset(ActivitynetTimeLensDataset):
 
 
 class TimeLens100KDataset:
+    """TimeLens-100K training corpus: 19,466 videos / 96,586 query-span pairs over five subsets
+    (cosmo_cap, internvid_vtime, didemo, queryd, hirest), 574.9 h.
+
+    VIDEO_ROOT is an ABSOLUTE path on the shared mount, following Ego4DNLQDataset and
+    ActivityNetOmniEmbedDataset: the corpus is 136 GiB of mp4 and is deliberately not copied into
+    data/. Fetched from the authors' HuggingFace release by
+    experiments/nsp2-foveation/g2_fetch_timelens100k.sh, whose extraction root is this directory;
+    the tars' internal paths are <subset>/<id>.mp4, matching the jsonl's video_path exactly, so no
+    path rewriting happens anywhere.
+    """
+
     ANNO_PATH_TRAIN = "data/TimeLens-100K/timelens-100k.jsonl"
-    VIDEO_ROOT = "data/TimeLens-100K/videos"
+    VIDEO_ROOT = "/gpfs/public/datasets/TimeLens-100K/videos"
 
     @classmethod
-    def load_annos(self, split="train"):
+    def load_annos(cls, split="train"):
         assert split == "train", f"Invalid split: {split}"
-        raw_anno = []
-        with open(self.ANNO_PATH_TRAIN, "r", encoding="utf-8") as f:
+        raw_annos = []
+        with open(cls.ANNO_PATH_TRAIN, "r", encoding="utf-8") as f:
             for line in f:
-                data = json.loads(line)
-                raw_anno.append(data)
+                raw_annos.append(json.loads(line))
+
+        # Checked before any anno is emitted, so a missing corpus cannot reach a training loop as
+        # unloadable paths. See check_videos_present for why this is not a commented-out line.
+        missing = check_videos_present(
+            [os.path.join(cls.VIDEO_ROOT, raw["video_path"]) for raw in raw_annos],
+            cls.__name__,
+            cls.VIDEO_ROOT,
+        )
 
         annos = []
-        for raw_anno in raw_anno:
-            video_path = os.path.join(self.VIDEO_ROOT, raw_anno["video_path"])
-            # if not os.path.exists(video_path):
-            # raise FileNotFoundError(f"Video path does not exist: {video_path}")
+        for raw_anno in raw_annos:
+            video_path = os.path.join(cls.VIDEO_ROOT, raw_anno["video_path"])
+            if video_path in missing:
+                continue
             for event in raw_anno["events"]:
                 query = parse_query(event["query"])
                 span = event["span"]
