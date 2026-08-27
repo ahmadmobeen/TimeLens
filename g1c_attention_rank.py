@@ -1,0 +1,1 @@
+../../experiments/nsp2-foveation/g1c_attention_rank.py

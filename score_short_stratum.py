@@ -1,0 +1,1 @@
+../../experiments/nsp1-zoom/score_short_stratum.py

@@ -64,7 +64,7 @@ if __name__ == "__main__":
     model = AutoModelForImageTextToText.from_pretrained(
         args.model_path,
         dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",  # flash-attn .so ABI-mismatched vs torch 2.9; sdpa for B200 repro
         device_map=args.device,
     ).eval()
 
@@ -83,6 +83,25 @@ if __name__ == "__main__":
     # 1. balance the video length for each GPU
     # 2. long videos are more likely to cause OOM, so we put them first
     annos.sort(key=lambda x: x["duration"], reverse=True)
+
+    # NS-P1 #1 (same-resolution fps sweep): optional GT-moment-length filter to build a
+    # short-heavy subset. TIMELENS_LEN_MAX keeps only moments with (end-start) <= the value,
+    # so a deterministic short subset can be evaluated at matched per-frame resolution across
+    # fps levels. Applied BEFORE the pair cap. Unset => no length filter.
+    len_max = os.environ.get("TIMELENS_LEN_MAX")
+    if len_max:
+        thr = float(len_max)
+        annos = [a for a in annos if (a["span"][0][1] - a["span"][0][0]) <= thr]
+        print(f"TIMELENS_LEN_MAX={len_max}: keeping {len(annos)} moments with GT length <= {thr}s")
+
+    # Optional bounded-subset cap for partial runs under heavy cluster I/O.
+    # Applied to the full sorted list BEFORE chunking so the cap is the total
+    # pair count across all GPU workers (deterministic subset). Unset => full eval.
+    max_pairs = os.environ.get("TIMELENS_MAX_PAIRS")
+    if max_pairs:
+        annos = annos[: int(max_pairs)]
+        print(f"TIMELENS_MAX_PAIRS={max_pairs}: capping to {len(annos)} total pairs (partial run)")
+
     annos = annos[args.index :: args.chunk]
 
     dataset = GroundingDataset(annos, processor, args)

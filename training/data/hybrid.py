@@ -37,7 +37,11 @@ class HybridDataset(Dataset):
                 filter_args = _build_default_filter_args(data_args.target_size)
                 dataset_name = name
             elif name == "filtered_hybrid":
-                filter_args = _build_default_filter_args(data_args.target_size)
+                # filtered_hybrid manifests (raw_anno_path) are already the final,
+                # curated training set — e.g. the NS-P1 D-lever length-rebalanced mix,
+                # where the equal-volume control is baked in offline. Use them as-is;
+                # the duration-bucket resampler is only for the raw TimeLens-100K corpus.
+                filter_args = None
                 dataset_name = "filtered_hybrid"
             else:
                 raise ValueError(

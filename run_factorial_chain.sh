@@ -1,0 +1,1 @@
+../../experiments/nsp1-zoom/run_factorial_chain.sh

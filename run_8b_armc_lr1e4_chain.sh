@@ -1,0 +1,1 @@
+../../experiments/nsp1-zoom/run_8b_armc_lr1e4_chain.sh

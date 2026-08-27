@@ -17,6 +17,7 @@ from transformers import BitsAndBytesConfig, HfArgumentParser
 
 from training.params import DataArguments, ModelArguments, TrainingArguments
 from training.trainer import QwenSFTTrainer
+from training.ecsharp import ECSharpConfig, ECSharpHead, ECSharpTrainer, vis_token_ids
 from training.data import HybridDataCollator, HybridDataset
 from training.train.train_utils import (
     get_peft_state_maybe_zero_3,
@@ -77,7 +78,35 @@ def configure_llm(model, training_args):
     set_requires_grad(llm_params, not training_args.freeze_llm)
 
 
+def _apply_qwen3vl_conv3d_workaround():
+    """Route Qwen3-VL's vision patch embedding around the PyTorch 2.9 Conv3d regression.
+
+    WHY TRAINING NEEDS THIS TOO. The workaround was added to the eval harnesses
+    (eval_bench.py, eval_zoom.py) and not here, and that omission cost 59 GPU-hours: the
+    first TimeLens-8B arm reached step 28 of 200 with the trainer itself projecting
+    340 more hours. On torch 2.9.x the bf16 Conv3d dispatches to
+    aten::slow_conv_dilated3d (pytorch/pytorch#174051), which is ~240,000x slower on this
+    shape and, in training, retains its per-element select/copy_ intermediates for the
+    backward pass -- hence 176-182 GB of 183 GB resident per card.
+
+    Training is hit harder than inference because it runs at 448 frames per sample against
+    ~300 for the eval splits, and pays the cost on the backward pass as well.
+
+    A no-op for TimeLens-7B and any Qwen2.5-VL model: it rebinds Qwen3-VL classes only,
+    which those never instantiate. Applied per rank, since each DeepSpeed rank imports
+    this module in its own process.
+    """
+    try:
+        import fast_patch_embed
+    except ImportError:
+        print("[warn] fast_patch_embed not importable; Qwen3-VL training will be "
+              "~240,000x slower on patch_embed (see issue #82)", flush=True)
+        return
+    fast_patch_embed.patch()
+
+
 def train():
+    _apply_qwen3vl_conv3d_workaround()
     global local_rank
 
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
@@ -232,7 +261,25 @@ def train():
     import random
     random.seed(training_args.seed)
 
-    trainer = QwenSFTTrainer(
+    # NS-P1 loss-1 Stage 2 (EC-Sharp): if enabled, attach a jointly-trained per-frame soft-argmax
+    # center head as a model submodule (so create_optimizer + deepspeed manage its params) and use
+    # the aux-loss trainer. Off => plain SFT (QwenSFTTrainer) exactly as before.
+    ec_cfg = ECSharpConfig()
+    ec_head = None
+    trainer_cls = QwenSFTTrainer
+    trainer_extra = {}
+    if ec_cfg.enabled:
+        hidden = int(getattr(model.config, "hidden_size", 3584) or 3584)
+        ec_head = ECSharpHead(hidden).to(compute_dtype)
+        for p in ec_head.parameters():
+            p.requires_grad = True
+        model.ec_head = ec_head
+        vids = torch.tensor(vis_token_ids(model.config), dtype=torch.long)
+        trainer_cls = ECSharpTrainer
+        trainer_extra = {"ec_head": ec_head, "ec_cfg": ec_cfg, "vis_ids": vids}
+        rank0_print(f"EC-Sharp ENABLED: {ec_cfg} | head hidden={hidden} | vis_ids={vids.tolist()}")
+
+    trainer = trainer_cls(
         model=model,
         processing_class=processor,
         args=training_args,
@@ -240,6 +287,7 @@ def train():
         train_dataset=HybridDataset(
             processor, model.config, model_args, data_args, training_args
         ),
+        **trainer_extra,
     )
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):

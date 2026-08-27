@@ -52,4 +52,7 @@ class HybridDataCollator:
         if "second_per_grid_ts" in batch[0]:
             data["second_per_grid_ts"] = [t for d in batch for t in d["second_per_grid_ts"]]
 
+        if "ecs_target" in batch[0]:  # NS-P1 EC-Sharp: (center,width,duration) seconds -> [B,3]
+            data["ecs_target"] = torch.stack([d["ecs_target"] for d in batch])
+
         return data

@@ -1,0 +1,1 @@
+../../experiments/nsp1-zoom/run_7b_anet_natural_chain.sh

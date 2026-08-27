@@ -1,0 +1,1 @@
+../../experiments/nsp2-foveation/g1d_capture_hidden.py

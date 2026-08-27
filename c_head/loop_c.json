@@ -1,0 +1,17 @@
+{
+  "name": "C-boundary-head",
+  "_doc": "Research-loop spec for NS-P1 method bet C. Run from repo ROOT: python experiments/research_loop/loop.py --spec research/TimeLens/c_head/loop_c.json . FROZEN FRAME: action space = {arm, lr, lambda_giou, epochs, tag}; gate = beat text-decode baseline on [0,2s) R@0.7 (s0_r07) while keeping mid/long mIoU >= 0.55 (no M/L regression). Validated by the post-answer smoke before use.",
+  "run_cmd": "env -u VIRTUAL_ENV CUDA_VISIBLE_DEVICES={gpu} OMP_NUM_THREADS=8 PYTHONPATH=. ./.venv/bin/python -m c_head.train_head --tag {tag} --arm {arm} --name {name} --lr {lr} --lambda_giou {lambda_giou} --epochs {epochs}",
+  "run_cwd": "research/TimeLens",
+  "score_cmd": "env -u VIRTUAL_ENV PYTHONPATH=. uv run python research/TimeLens/score_head.py --ckpt {name} --json {json_out}",
+  "score_cwd": ".",
+  "gate": {"primary": "s0_r07", "maximize": true, "baseline": 0.015},
+  "guard": {"metric": "midlong_miou", "min": 0.55},
+  "candidates": [
+    {"name": "ans_giou",    "arm": "ans",     "lr": 5e-4, "lambda_giou": 1, "epochs": 60, "tag": "train_natural.postans", "gpu": 1},
+    {"name": "ans_l1",      "arm": "ans",     "lr": 5e-4, "lambda_giou": 0, "epochs": 80, "tag": "train_natural.postans", "gpu": 1},
+    {"name": "ans_lr1e3",   "arm": "ans",     "lr": 1e-3, "lambda_giou": 1, "epochs": 80, "tag": "train_natural.postans", "gpu": 1},
+    {"name": "xattn_giou",  "arm": "xattn",   "lr": 5e-4, "lambda_giou": 1, "epochs": 60, "tag": "train_natural.postans", "gpu": 1},
+    {"name": "vismean_giou","arm": "vismean", "lr": 5e-4, "lambda_giou": 1, "epochs": 60, "tag": "train_natural.postans", "gpu": 1}
+  ]
+}

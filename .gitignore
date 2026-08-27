@@ -12,3 +12,9 @@ __pycache__
 /output
 /tensorboard
 /wandb
+
+# NS-P1 additions (fork-local). .venv self-ignores via uv's own .venv/.gitignore,
+# but that file is not ours to rely on: 8.4G becomes stageable the moment it goes.
+.venv/
+# agent scratch, not source
+.review_work/
