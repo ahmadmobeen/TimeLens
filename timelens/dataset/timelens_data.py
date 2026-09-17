@@ -62,8 +62,14 @@ def check_videos_present(video_paths, dataset_name, video_root):
 
 
 class ActivitynetTimeLensDataset:
+    # VIDEO_ROOT is an ABSOLUTE path on the shared mount, following Ego4DNLQDataset and
+    # TimeLens100KDataset. ActivityNet-TimeLens re-annotates the SAME ActivityNet videos the
+    # omniembed split already uses, so there is nothing to download: the relative
+    # data/TimeLens-Bench/videos/activitynet was never populated, and pointing at the existing
+    # corpus resolves all of it. Verified by id: annotation keys are v_XXXXXXXXXXX and the files
+    # are {id}.mp4 under this root.
     ANNO_PATH_TEST = "data/TimeLens-Bench/activitynet-timelens.json"
-    VIDEO_ROOT = "data/TimeLens-Bench/videos/activitynet"
+    VIDEO_ROOT = "/gpfs/public/datasets/omniembed/activitynet_captions/videos/Activity_Videos"
     DATASET_SOURCE = "ActivityNet-TimeLens"
 
     @classmethod
@@ -73,11 +79,19 @@ class ActivitynetTimeLensDataset:
         with open(cls.ANNO_PATH_TEST, "r") as f:
             raw_annos = json.load(f)
 
+        # Checked before any anno is emitted. This was a commented-out per-item check, so a wrong
+        # VIDEO_ROOT yielded zero clips in silence: shards launched, wrote 0 records, exited 0.
+        missing = check_videos_present(
+            [os.path.join(cls.VIDEO_ROOT, vid + ".mp4") for vid in raw_annos],
+            cls.__name__,
+            cls.VIDEO_ROOT,
+        )
+
         annos = []
         for vid, raw_anno in raw_annos.items():
             video_path = os.path.join(cls.VIDEO_ROOT, vid + ".mp4")
-            # if not os.path.exists(video_path):
-            # raise FileNotFoundError(f"Video path does not exist: {video_path}")
+            if video_path in missing:
+                continue
             for span, query in zip(raw_anno["spans"], raw_anno["queries"]):
                 anno = dict(
                     source=cls.DATASET_SOURCE,
