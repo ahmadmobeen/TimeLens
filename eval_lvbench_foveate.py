@@ -54,6 +54,9 @@ PROMPT = (
 _TR = re.compile(r"^(\d+):(\d+)(?::(\d+))?-(\d+):(\d+)(?::(\d+))?$")
 _LETTER = re.compile(r"\b([ABCD])\b")
 
+# Abort an arm after this many failures with nothing scored (broken harness).
+FAIL_FAST_SKIPS = 25
+
 
 def parse_time_reference(text: str) -> tuple[float, float] | None:
     """`MM:SS-MM:SS` or `HH:MM:SS-HH:MM:SS` -> (start, end) seconds, else None.
@@ -161,6 +164,16 @@ def main() -> None:
 
     processor = AutoProcessor.from_pretrained(args.model, padding_side="left",
                                               trust_remote_code=True)
+    # Pick the video contract by CAPABILITY, not by model name. transformers 4.57 routes
+    # stock Qwen2_5_VLProcessor through `self.video_processor`, which takes videos=[frames]
+    # with a separate video_metadata= kwarg. The legacy [(frames, metadata)] tuple form that
+    # TimeLens-7B's bundled processor still accepts is flattened to an empty list there and
+    # dies as `IndexError: list index out of range` inside convert_pil_frames_to_video --
+    # once per item, which the per-item handler below swallows as a skip, so the run exits 0
+    # having produced nothing. That is exactly what happened on the first E3 attempt.
+    new_video_api = getattr(processor, "video_processor", None) is not None
+    print(f"processor={type(processor).__name__} "
+          f"contract={'video_metadata kwarg' if new_video_api else 'legacy tuple'}", flush=True)
     model = AutoModelForImageTextToText.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
         device_map="cuda", trust_remote_code=True).eval()
@@ -214,8 +227,13 @@ def main() -> None:
                     {"type": "text", "text": PROMPT.format(item["question"])}]}]
                 text = processor.apply_chat_template(messages, tokenize=False,
                                                      add_generation_prompt=True)
-                inputs = processor(text=[text], images=None, videos=[(frames, vmeta)],
-                                   padding=True, return_tensors="pt").to("cuda")
+                if new_video_api:
+                    inputs = processor(text=[text], images=None, videos=[frames],
+                                       video_metadata=[vmeta], do_sample_frames=False,
+                                       padding=True, return_tensors="pt").to("cuda")
+                else:
+                    inputs = processor(text=[text], images=None, videos=[(frames, vmeta)],
+                                       padding=True, return_tensors="pt").to("cuda")
                 out_ids = model.generate(**inputs, do_sample=False, temperature=None,
                                          top_p=None, top_k=None, max_new_tokens=16)
                 reply = processor.batch_decode(
@@ -223,6 +241,15 @@ def main() -> None:
             except Exception as ex:  # one bad video must not kill the run
                 skipped += 1
                 print(f"  [skip {skipped}] {item['key']} | {ex!r}", flush=True)
+                # ... but EVERY video failing is a broken harness, not bad data. Without
+                # this the run churns through all 1,534 items, writes nothing and exits 0,
+                # which reads downstream as "this arm scored nothing" rather than "this arm
+                # never ran". Fail loudly while the cause is still on screen.
+                if n_done == 0 and skipped >= FAIL_FAST_SKIPS:
+                    raise RuntimeError(
+                        f"{skipped} consecutive failures with no successful item; "
+                        f"last error: {ex!r}. The harness is broken, not the data."
+                    ) from ex
                 continue
 
             pred = parse_letter(reply)
