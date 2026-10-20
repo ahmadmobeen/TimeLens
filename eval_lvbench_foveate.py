@@ -133,7 +133,11 @@ def main() -> None:
     ap.add_argument("--parquet",
                     default="/home/mobeen/codes/active_repos/NeedleScan-vtg-landscape/"
                             "research/TimeLens/data/lvbench/data/train-00000-of-00001.parquet")
-    ap.add_argument("--meta", default="/tmp/claude-1001/lvbench_meta.jsonl")
+    ap.add_argument("--meta",
+                    default="/home/mobeen/codes/active_repos/NeedleScan-vtg-landscape/"
+                            "research/TimeLens/data/lvbench/video_info.meta.jsonl",
+                    help="duration metadata; kept beside the parquet on NFS because "
+                         "/tmp does not survive a pod restart")
     ap.add_argument("--video_dir",
                     default="/home/mobeen/codes/active_repos/NeedleScan-vtg-landscape/"
                             "research/TimeLens/data/lvbench/videos")

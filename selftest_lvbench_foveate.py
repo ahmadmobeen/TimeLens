@@ -24,7 +24,8 @@ from eval_lvbench_foveate import load_questions, parse_letter, parse_time_refere
 
 PARQUET = ("/home/mobeen/codes/active_repos/NeedleScan-vtg-landscape/research/TimeLens/"
            "data/lvbench/data/train-00000-of-00001.parquet")
-META = "/tmp/claude-1001/lvbench_meta.jsonl"
+META = ("/home/mobeen/codes/active_repos/NeedleScan-vtg-landscape/research/TimeLens/"
+        "data/lvbench/video_info.meta.jsonl")
 VIDEOS = ("/home/mobeen/codes/active_repos/NeedleScan-vtg-landscape/research/TimeLens/"
           "data/lvbench/videos")
 
