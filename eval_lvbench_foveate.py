@@ -229,10 +229,20 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0,
                     help="fixes the --shuffle_query rotation")
     ap.add_argument("--limit", type=int, default=0, help="smoke-test on the first N questions")
+    ap.add_argument("--sample", type=int, default=0,
+                    help="a seeded random subset of N questions (kept in video order, so the "
+                         "per-video reference memo still applies); --limit takes the first N, "
+                         "which covers only a handful of videos")
     args = ap.parse_args()
 
     items, census = load_questions(args.parquet, args.meta, args.video_dir)
     print(f"population: {census}", flush=True)
+    if args.sample:
+        import random as _rs
+        keep = set(_rs.Random(args.seed).sample(range(len(items)), args.sample))
+        items = [it for i, it in enumerate(items) if i in keep]
+        print(f"sample: {len(items)} questions from {len({it['key'] for it in items})} videos "
+              f"(seed {args.seed})", flush=True)
     if args.limit:
         items = items[: args.limit]
 
