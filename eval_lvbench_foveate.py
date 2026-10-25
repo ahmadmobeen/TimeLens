@@ -80,6 +80,36 @@ def parse_letter(answer: str) -> str | None:
     return m.group(1) if m else None
 
 
+@torch.no_grad()
+def prior_center(frames, duration: float, question: str, model, proc,
+                 true_center: float, smooth: int = 5) -> tuple[float, float]:
+    """Predicted evidence centre from query-frame similarity, and its error.
+
+    `frames` are the uniform reference frames already decoded for this item, so the
+    prior reads nothing new off disk and the expensive VLM still runs exactly once --
+    the single-pass constraint this project is built around.
+
+    The option list is stripped from the question: only the stem says what to look
+    for, and the three distractors would blur the query embedding.
+
+    Returns (centre in seconds, |centre - true centre|). The error is logged per item
+    so the prior's localization quality can be read independently of whether the
+    downstream answer happened to come out right.
+    """
+    stem = question.split("\n(A)")[0].strip() or question.strip()
+    n = frames.shape[0]
+    imgs = [frames[i].permute(1, 2, 0).to(torch.uint8).cpu().numpy() for i in range(n)]
+    batch = proc(text=[stem], images=imgs, padding="max_length", truncation=True,
+                 return_tensors="pt").to("cuda")
+    sim = model(**batch).logits_per_text[0].float()            # one score per frame
+    if n >= smooth:                                            # join single-frame spikes
+        k = torch.ones(1, 1, smooth, device=sim.device) / smooth
+        sm = torch.nn.functional.conv1d(sim[None, None], k, padding=smooth // 2)[0, 0][:n]
+        sim = torch.maximum(sm, sim)
+    centre = duration * (int(torch.argmax(sim)) + 0.5) / n     # uniform frame times
+    return centre, abs(centre - true_center)
+
+
 def load_questions(parquet: str, meta_jsonl: str, video_dir: str) -> tuple[list[dict], dict]:
     """Scoreable LVBench questions plus a census of everything dropped and why."""
     import pandas as pd
@@ -145,6 +175,20 @@ def main() -> None:
                     default="/home/mobeen/codes/active_repos/NeedleScan-vtg-landscape/"
                             "research/TimeLens/data/lvbench/videos")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--center", choices=["gt", "prior"], default="gt",
+                    help="gt = oracle evidence midpoint (a CEILING). prior = SigLIP "
+                         "query-frame similarity over the reference frames already "
+                         "decoded, i.e. an achievable method with no extra video decode.")
+    ap.add_argument("--prior_model", default="google/siglip-so400m-patch14-384")
+    ap.add_argument("--scan_frames", type=int, default=256,
+                    help="candidate frames scored for the topk_siglip arm")
+    ap.add_argument("--shuffle_query", action="store_true",
+                    help="PLACEBO: score frames with a DIFFERENT question's text while "
+                         "answering the real one. Measures how much of a selector's gain "
+                         "is actually query-driven. Swift Sampling (2605.22678) scores "
+                         "with no query at all and matches AKS on easier benchmarks; "
+                         "nobody has run this on LVBench, where query conditioning is "
+                         "supposedly worth +7 to +12.")
     ap.add_argument("--limit", type=int, default=0, help="smoke-test on the first N questions")
     args = ap.parse_args()
 
@@ -178,6 +222,24 @@ def main() -> None:
         args.model, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
         device_map="cuda", trust_remote_code=True).eval()
 
+    # the placebo pairs each item with another item's question text, fixed by seed
+    scoring_text = {}
+    if args.shuffle_query:
+        import random as _r
+        qs = [it["question"] for it in items]
+        rot = _r.Random(args.seed + 1).randrange(1, max(len(qs), 2))
+        for i, it in enumerate(items):
+            scoring_text[it["key"] + it["uid"]] = qs[(i + rot) % len(qs)]
+        print(f"PLACEBO: scoring with another question's text (rotation {rot})", flush=True)
+
+    prior_model = prior_proc = None
+    if args.center == "prior" or args.arm == "topk_siglip":
+        from transformers import AutoModel
+        prior_proc = AutoProcessor.from_pretrained(args.prior_model)
+        prior_model = AutoModel.from_pretrained(
+            args.prior_model, torch_dtype=torch.float16).to("cuda").eval()
+        print(f"prior encoder: {args.prior_model}", flush=True)
+
     realized: list[float] = []
     n_done = skipped = correct = unparsed = 0
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -203,8 +265,16 @@ def main() -> None:
                 dur = total / native_fps
 
                 # 2) Place N frames by the kernel, then read exactly those indices.
-                center = min(max(item["center"], 0.0), dur)
-                if args.arm == "uniform":
+                if args.center == "prior":
+                    center, prior_err = prior_center(
+                        ref_tensor, dur, item["question"], prior_model, prior_proc,
+                        item["center"])
+                else:
+                    center = min(max(item["center"], 0.0), dur)
+                    prior_err = None
+                if args.arm in ("uniform", "topk_siglip"):
+                    # topk_siglip only needs n and the frame grid here; the actual
+                    # indices are replaced by the SigLIP selection below.
                     times = kernel_times("uniform", center, dur, n)
                 else:
                     times = kernel_times(args.arm, center, dur, n,
@@ -212,8 +282,30 @@ def main() -> None:
                 if args.arm.startswith("offpeak"):
                     realized.append(abs(min(dur, center + args.offpeak_shift) - center))
                 idx = times_to_indices(times, native_fps, total, n)
-
                 vr = VideoReader(item["video_path"])
+
+                if args.arm == "topk_siglip":
+                    # Score a denser uniform scan, keep the n best frames. This is the
+                    # field's dominant recipe: plain argmax top-k captures ~88% of the
+                    # reported gain, every published aggregation adding ~+0.9 on top.
+                    scan = [min(total - 1, int(total * (i + 0.5) / args.scan_frames))
+                            for i in range(args.scan_frames)]
+                    sf = torch.from_numpy(vr.get_batch(scan).asnumpy()).permute(0, 3, 1, 2)
+                    sf = torch.nn.functional.interpolate(
+                        sf.float(), size=(384, 384), mode="bilinear",
+                        align_corners=False, antialias=True).clamp(0, 255)
+                    qtext = scoring_text.get(item["key"] + item["uid"], item["question"])
+                    stem = qtext.split("\n(A)")[0].strip() or qtext.strip()
+                    with torch.no_grad():
+                        bt = prior_proc(text=[stem],
+                                        images=[sf[i].permute(1, 2, 0).to(torch.uint8).cpu().numpy()
+                                                for i in range(sf.shape[0])],
+                                        padding="max_length", truncation=True,
+                                        return_tensors="pt").to("cuda")
+                        sim = prior_model(**bt).logits_per_text[0].float()
+                    best = torch.topk(sim, min(n, len(scan))).indices.tolist()
+                    idx = sorted({scan[i] for i in best})
+
                 frames = torch.from_numpy(vr.get_batch(idx).asnumpy()).permute(0, 3, 1, 2)
                 frames = torch.nn.functional.interpolate(
                     frames.float(), size=(H, W), mode="bicubic",
@@ -261,6 +353,7 @@ def main() -> None:
             out_fh.write(json.dumps({
                 "key": key, "arm": args.arm, "pred_letter": pred, "gold_letter": item["gold"],
                 "correct": is_correct, "raw": reply.strip()[:80], "center_s": center,
+                "prior_abs_err_s": prior_err,
                 "span": item["span"], "duration_s": dur, "n_frames": len(idx)}) + "\n")
             out_fh.flush()
             if n_done % 50 == 0:
