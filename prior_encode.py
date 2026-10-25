@@ -8,6 +8,12 @@ the 5-fold cross-validated posterior temperature and its held-out NLL.
 
   .venv/bin/python -u prior_encode.py --model google/siglip2-giant-opt-patch16-384 \\
       --name siglip2_giant
+
+Qwen3-VL-Embedding (2B/8B) is a second family: a VLM embedder, scored by cosine x 100.
+Frames use the model's default instruction and last-token pooling, as in the reference
+implementation (QwenLM/Qwen3-VL-Embedding, src/models/qwen3_vl_embedding.py); queries
+use QUERY_INSTRUCTION. Its Conv3d patch embedding is swapped for the identical matmul
+(fast_patch_embed.py), without which bf16 on a B200 takes seconds per frame.
 """
 from __future__ import annotations
 
@@ -28,12 +34,77 @@ from t1_decode import OUT as FRAMES
 from t1_train import dist_to_span, summarize, window_scores
 
 CHUNK = 256
+QUERY_INSTRUCTION = ("Find the video frame that shows what this question about the video "
+                     "asks about.")
+_QPROC = None
+
+
+def is_qwen3_emb(model_id: str) -> bool:
+    return "Qwen3-VL-Embedding" in model_id
+
+
+def qwen3_conversation(instruction: str, image=None, text: str | None = None) -> list[dict]:
+    content = []
+    if image is not None:
+        content.append({"type": "image", "image": image, "min_pixels": 4 * 32 * 32,
+                        "max_pixels": 1800 * 32 * 32})
+    if text is not None:
+        content.append({"type": "text", "text": text})
+    return [{"role": "system", "content": [{"type": "text", "text": instruction}]},
+            {"role": "user", "content": content}]
+
+
+def qwen3_inputs(proc, conversations: list) -> dict:
+    from qwen_vl_utils.vision_process import process_vision_info
+    text = proc.apply_chat_template(conversations, add_generation_prompt=True, tokenize=False)
+    images, _ = process_vision_info(conversations, image_patch_size=16)
+    return proc(text=text, images=images, padding=True, do_resize=False, return_tensors="pt")
+
+
+def load_qwen3_emb(model_id: str):
+    """(model, processor). The checkpoint stores weights under `model.*` (the reference
+    wraps a Qwen3VLModel as `.model`), so a bare Qwen3VLModel.from_pretrained loads
+    NOTHING and runs randomly initialised -- verified the hard way. Mirror the wrapper,
+    and refuse to continue if any key is missing or unexpected."""
+    import fast_patch_embed
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (Qwen3VLModel,
+                                                                Qwen3VLPreTrainedModel)
+    from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+    fast_patch_embed.patch(verbose=False)
+
+    class Qwen3VLForEmbedding(Qwen3VLPreTrainedModel):
+        _checkpoint_conversion_mapping: dict = {}
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.model = Qwen3VLModel(config)
+            self.post_init()
+
+        def forward(self, **kwargs):
+            return self.model(**kwargs)
+
+    model, info = Qwen3VLForEmbedding.from_pretrained(model_id, dtype=torch.bfloat16,
+                                                      output_loading_info=True)
+    bad = list(info["missing_keys"]) + list(info["unexpected_keys"])
+    if bad:
+        raise RuntimeError(f"{model_id}: weights did not load ({len(info['missing_keys'])} "
+                           f"missing, {len(info['unexpected_keys'])} unexpected, e.g. {bad[:3]})")
+    return (model.to("cuda").eval(),
+            Qwen3VLProcessor.from_pretrained(model_id, padding_side="right"))
+
+
+@torch.no_grad()
+def qwen3_embed(model, inputs: dict) -> torch.Tensor:
+    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    h = model(**inputs).last_hidden_state
+    last = inputs["attention_mask"].sum(1) - 1                 # right padding
+    return torch.nn.functional.normalize(h[torch.arange(len(h), device=h.device), last].float(), dim=-1)
 
 
 class Chunks(Dataset):
-    def __init__(self, vids: list[tuple[str, int]], proc):
-        self.items = [(v, a, min(a + CHUNK, n)) for v, n in vids for a in range(0, n, CHUNK)]
-        self.proc = proc
+    def __init__(self, vids: list[tuple[str, int]], proc, model_id: str = "", chunk: int = CHUNK):
+        self.items = [(v, a, min(a + chunk, n)) for v, n in vids for a in range(0, n, chunk)]
+        self.proc, self.model_id = proc, model_id
 
     def __len__(self) -> int:
         return len(self.items)
@@ -47,11 +118,14 @@ class Chunks(Dataset):
             blob = fh.read(off[b] - off[a])
         imgs = [Image.open(io.BytesIO(blob[off[k] - off[a]:off[k + 1] - off[a]])).convert("RGB")
                 for k in range(a, b)]
+        if is_qwen3_emb(self.model_id):
+            convs = [qwen3_conversation("Represent the user's input.", image=im) for im in imgs]
+            return dict(qwen3_inputs(self.proc, convs)), (vid, a, b)
         px = self.proc(images=imgs, return_tensors="pt")["pixel_values"]
         return px, (vid, a, b)
 
 
-def encode_images(model, proc, out_dir: str, workers: int) -> dict[str, np.ndarray]:
+def encode_images(model, proc, out_dir: str, workers: int, model_id: str = "") -> dict[str, np.ndarray]:
     path = os.path.join(out_dir, "lvbench_img.npz")
     if os.path.exists(path):
         with np.load(path) as z:
@@ -61,17 +135,21 @@ def encode_images(model, proc, out_dir: str, workers: int) -> dict[str, np.ndarr
         if name.endswith(".json"):
             with open(os.path.join(FRAMES, "lvbench", name), encoding="utf-8") as fh:
                 vids.append((name[:-5], len(json.load(fh)["t"])))
-    loader = DataLoader(Chunks(vids, proc), batch_size=None, num_workers=workers,
-                        prefetch_factor=2)
+    q3 = is_qwen3_emb(model_id)
+    loader = DataLoader(Chunks(vids, proc, model_id, chunk=32 if q3 else CHUNK), batch_size=None,
+                        num_workers=workers, prefetch_factor=2)
     acc: dict[str, list] = {}
     done = 0
     for px, (vid, a, b) in loader:
         with torch.no_grad():
-            e = model.get_image_features(pixel_values=px.to("cuda", torch.float16))
+            if q3:
+                e = qwen3_embed(model, px)
+            else:
+                e = model.get_image_features(pixel_values=px.to("cuda", torch.float16))
         acc.setdefault(vid, []).append((a, torch.nn.functional.normalize(e.float(), dim=-1)
                                         .cpu().numpy().astype(np.float16)))
         done += b - a
-        if done % (CHUNK * 100) < CHUNK:
+        if done % (CHUNK * 100) < (b - a):
             print(f"  {done} frames", flush=True)
     feats = {v: np.concatenate([p[1] for p in sorted(parts, key=lambda p: p[0])])
              for v, parts in acc.items()}
@@ -115,11 +193,16 @@ def main() -> None:
     from transformers import AutoModel, AutoProcessor
     out_dir = os.path.join("data/t1/priors", args.name)
     os.makedirs(out_dir, exist_ok=True)
-    proc = AutoProcessor.from_pretrained(args.model)
-    model = AutoModel.from_pretrained(args.model, dtype=torch.float16).to("cuda").eval()
-    feats = encode_images(model, proc, out_dir, args.workers)
-    scale = float(model.logit_scale.exp()) if hasattr(model, "logit_scale") else 100.0
-    bias = float(model.logit_bias) if getattr(model, "logit_bias", None) is not None else 0.0
+    q3 = is_qwen3_emb(args.model)
+    if q3:
+        model, proc = load_qwen3_emb(args.model)
+        scale, bias = 100.0, 0.0
+    else:
+        proc = AutoProcessor.from_pretrained(args.model)
+        model = AutoModel.from_pretrained(args.model, dtype=torch.float16).to("cuda").eval()
+        scale = float(model.logit_scale.exp()) if hasattr(model, "logit_scale") else 100.0
+        bias = float(model.logit_bias) if getattr(model, "logit_bias", None) is not None else 0.0
+    feats = encode_images(model, proc, out_dir, args.workers, args.model)
 
     items = [i for i in lvbench_items() if i["key"] in feats]
     texts, index = [], []
@@ -129,10 +212,14 @@ def main() -> None:
         texts += [stem] + [f"{stem} {o}" for o in opts]
     emb = []
     for i in range(0, len(texts), 256):
-        t = proc(text=texts[i:i + 256], padding="max_length", truncation=True, max_length=64,
-                 return_tensors="pt")
-        with torch.no_grad():
-            e = model.get_text_features(input_ids=t["input_ids"].to("cuda"))
+        if q3:
+            convs = [qwen3_conversation(QUERY_INSTRUCTION, text=t) for t in texts[i:i + 256]]
+            e = qwen3_embed(model, dict(qwen3_inputs(proc, convs)))
+        else:
+            t = proc(text=texts[i:i + 256], padding="max_length", truncation=True, max_length=64,
+                     return_tensors="pt")
+            with torch.no_grad():
+                e = model.get_text_features(input_ids=t["input_ids"].to("cuda"))
         emb.append(torch.nn.functional.normalize(e.float(), dim=-1).cpu().numpy())
     emb = np.concatenate(emb)
 
