@@ -80,6 +80,33 @@ def parse_letter(answer: str) -> str | None:
     return m.group(1) if m else None
 
 
+def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float) -> list[float]:
+    """Frame times from a per-second score curve (second k covers [k, k+1)).
+
+    topk   the n highest-scoring seconds.
+    kelly  inverse-CDF quantiles of (1 - eps) * softmax(z / tau) + eps * uniform: frames
+           in proportion to posterior mass. When accuracy grows with log(frames on the
+           evidence), as E3's ladder shows, proportional allocation maximises expected
+           accuracy; eps of the budget stays uniform as a hedge against a confidently
+           wrong posterior (E3's placebo: concentration in the wrong place costs 5 pts).
+    """
+    import numpy as np
+    z = np.asarray(z, dtype=np.float64)[:max(1, int(np.ceil(dur)))]
+    T = len(z)
+    if alloc == "topk":
+        return sorted(float(k) + 0.5 for k in np.argsort(-z)[:n])
+    p = np.exp((z - z.max()) / tau)
+    p = (1 - eps) * p / p.sum() + eps / T
+    cdf = np.cumsum(p)
+    out = []
+    for i in range(n):
+        q = (i + 0.5) / n
+        k = min(int(np.searchsorted(cdf, q)), T - 1)
+        prev = cdf[k - 1] if k > 0 else 0.0
+        out.append(min(dur - 1e-3, k + (q - prev) / p[k]))
+    return out
+
+
 @torch.no_grad()
 def prior_center(frames, duration: float, question: str, model, proc,
                  true_center: float, smooth: int = 5) -> tuple[float, float]:
@@ -189,6 +216,18 @@ def main() -> None:
                          "with no query at all and matches AKS on easier benchmarks; "
                          "nobody has run this on LVBench, where query conditioning is "
                          "supposedly worth +7 to +12.")
+    ap.add_argument("--curves", default="",
+                    help="curve arm: npz of per-second score curves keyed "
+                         "'lvbench:<key>>>><uid>' (t1_train.py eval_lvbench writes them)")
+    ap.add_argument("--alloc", choices=["topk", "kelly"], default="kelly",
+                    help="curve arm: how a curve becomes frame times (see curve_times)")
+    ap.add_argument("--tau", type=float, default=1.0, help="kelly: posterior temperature")
+    ap.add_argument("--eps", type=float, default=0.5, help="kelly: uniform share of the budget")
+    ap.add_argument("--curve_placebo", action="store_true",
+                    help="curve arm PLACEBO: allocate with ANOTHER question's curve from the "
+                         "SAME video -- same video, same allocator, wrong question")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="fixes the --shuffle_query rotation")
     ap.add_argument("--limit", type=int, default=0, help="smoke-test on the first N questions")
     args = ap.parse_args()
 
@@ -232,6 +271,22 @@ def main() -> None:
             scoring_text[it["key"] + it["uid"]] = qs[(i + rot) % len(qs)]
         print(f"PLACEBO: scoring with another question's text (rotation {rot})", flush=True)
 
+    curves, curve_of = None, {}
+    if args.arm == "curve":
+        import numpy as np
+        curves = np.load(args.curves)
+        by_video: dict[str, list[str]] = {}
+        for it in items:
+            by_video.setdefault(it["key"], []).append(f"{it['key']}>>>{it['uid']}")
+        for keys in by_video.values():
+            assert len(keys) >= 2 or not args.curve_placebo, keys
+            for i, k in enumerate(keys):         # placebo: the next question, same video
+                src = keys[(i + 1) % len(keys)] if args.curve_placebo else k
+                curve_of[k] = "lvbench:" + src
+        print(f"curves: {args.curves} alloc={args.alloc} tau={args.tau} eps={args.eps}"
+              f"{' PLACEBO (same video, other question)' if args.curve_placebo else ''}",
+              flush=True)
+
     prior_model = prior_proc = None
     if args.center == "prior" or args.arm == "topk_siglip":
         from transformers import AutoModel
@@ -272,7 +327,7 @@ def main() -> None:
                 else:
                     center = min(max(item["center"], 0.0), dur)
                     prior_err = None
-                if args.arm in ("uniform", "topk_siglip"):
+                if args.arm in ("uniform", "topk_siglip", "curve"):
                     # topk_siglip only needs n and the frame grid here; the actual
                     # indices are replaced by the SigLIP selection below.
                     times = kernel_times("uniform", center, dur, n)
@@ -281,6 +336,9 @@ def main() -> None:
                                          offpeak_shift=args.offpeak_shift)
                 if args.arm.startswith("offpeak"):
                     realized.append(abs(min(dur, center + args.offpeak_shift) - center))
+                if args.arm == "curve":
+                    times = curve_times(curves[curve_of[key]], dur, n, args.alloc,
+                                        args.tau, args.eps)
                 idx = times_to_indices(times, native_fps, total, n)
                 vr = VideoReader(item["video_path"])
 
@@ -354,7 +412,9 @@ def main() -> None:
                 "key": key, "arm": args.arm, "pred_letter": pred, "gold_letter": item["gold"],
                 "correct": is_correct, "raw": reply.strip()[:80], "center_s": center,
                 "prior_abs_err_s": prior_err,
-                "span": item["span"], "duration_s": dur, "n_frames": len(idx)}) + "\n")
+                "span": item["span"], "duration_s": dur, "n_frames": len(idx),
+                "in_span": sum(item["span"][0] - 0.5 <= i / native_fps <= item["span"][1] + 0.5
+                               for i in idx)}) + "\n")
             out_fh.flush()
             if n_done % 50 == 0:
                 print(f"  [{n_done}/{len(items)}] acc {correct / n_done:.4f} "

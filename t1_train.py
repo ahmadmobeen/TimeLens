@@ -13,6 +13,7 @@ is free of cross-question calibration.
 
   --phase train          train, pick the checkpoint on VAL, report TEST synthetic
   --phase eval_lvbench   the stage-2 transfer test on the 1,534 E3/N3/B1 questions
+  --phase cv_lvbench     diagnostic: 5-fold by-video CV on LVBench itself
 """
 from __future__ import annotations
 
@@ -83,6 +84,8 @@ def sampler(corpora: list[Corpus], weights: list[float], args, out: queue.Queue,
         tls, keys = [], []
         for _ in range(B):
             i = rng.randrange(n)
+            while c.bank.T[c.queries["train"][i].vid] > L:     # must fit, or the batch
+                i = rng.randrange(n)                           # would be ragged
             mode = "cluster" if rng.random() < args.p_cluster else "random"
             tls.append(c.timeline("train", i, L, mode, rng))
             keys.append(c.queries["train"][i].key)
@@ -307,36 +310,57 @@ def report(test: dict) -> None:
 
 # ----------------------------------------------------------------------------- LVBench
 
-def eval_lvbench(args) -> None:
-    run_dir = os.path.join(RUNS, args.run)
-    text = Text()
-    ck = torch.load(os.path.join(run_dir, "best.pt"), map_location="cuda")
+def load_head(path: str) -> tuple[T1Head, dict]:
+    ck = torch.load(path, map_location="cuda")
     a = ck["args"]
     model = T1Head(d=a["d"], layers=a["layers"], dropout=a["dropout"],
-                   use_grid=not a["no_grid"]).cuda().eval()
+                   use_grid=not a["no_grid"]).cuda()
     model.load_state_dict(ck["model"])
+    return model.eval(), ck
+
+
+def lvbench_setup() -> tuple[Bank, list[dict], list[str]]:
     bank = Bank("lvbench")
     items = [i for i in lvbench_items() if i["key"] in bank.row]
-    keys = [f"lvbench:{i['key']}>>>{i['uid']}" for i in items]
+    return bank, items, [f"lvbench:{i['key']}>>>{i['uid']}" for i in items]
+
+
+def video_feats(bank: Bank, vid: str, n: int) -> torch.Tensor:
+    s = bank.start[vid]
+    return bank.feats[s:s + bank.T[vid]][None].expand(n, -1, -1, -1)
+
+
+def score_lvbench(model, text: Text, bank: Bank, items: list[dict], keys: list[str],
+                  seed: int) -> tuple[dict, dict]:
+    """Per-arm per-item records (head, zero-shot, and their cross-video placebo twins)
+    for the given questions, plus the head's per-second curves."""
     groups: dict[str, list[int]] = {}
     for j, it in enumerate(items):
         groups.setdefault(it["key"], []).append(j)
-    feats_fn = lambda sub: bank.feats[bank.start[items[sub[0]]["key"]]:
-                                      bank.start[items[sub[0]]["key"]] + bank.T[items[sub[0]]["key"]]
-                                      ][None].expand(len(sub), -1, -1, -1)
-    perm = derangement(len(items), 13, group=[it["key"] for it in items])
-    res, curves = {}, {}
+    feats_fn = lambda sub: video_feats(bank, items[sub[0]]["key"], len(sub))
+    perm = derangement(len(items), seed, group=[it["key"] for it in items])
+    per, curves = {}, {}
     for tag, ks in (("", keys), ("placebo_", [keys[p] for p in perm])):
         zm, zz = run_items(model, text, feats_fn, list(groups.values()), ks)
         if not tag:
             curves = {k: z.astype(np.float16) for k, z in zip(keys, zm)}
         for name, zs in (("head", zm), ("zeroshot", zz)):
-            per = []
+            recs = []
             for z, it in zip(zs, items):
                 lo, hi = span_seconds(it["span"][0], it["span"][1], len(z))
-                per.append({"windows": window_scores(z, it["duration"], it["center"]),
-                            "dist": dist_to_span(z, lo, hi)})
-            res[tag + name] = summarize(per)
+                recs.append({"windows": window_scores(z, it["duration"], it["center"]),
+                             "dist": dist_to_span(z, lo, hi)})
+            per[tag + name] = recs
+    return per, curves
+
+
+def eval_lvbench(args) -> None:
+    run_dir = os.path.join(RUNS, args.run)
+    text = Text()
+    model, ck = load_head(os.path.join(run_dir, "best.pt"))
+    bank, items, keys = lvbench_setup()
+    per, curves = score_lvbench(model, text, bank, items, keys, 13)
+    res = {arm: summarize(recs) for arm, recs in per.items()}
     np.savez(os.path.join(run_dir, "lvbench_curves.npz"), **curves)
     with open(os.path.join(run_dir, "lvbench.json"), "w", encoding="utf-8") as fh:
         json.dump({"step": ck["step"], "result": res}, fh, indent=1)
@@ -346,10 +370,74 @@ def eval_lvbench(args) -> None:
           "(prompted 0.564, probed 0.551)", flush=True)
 
 
+def cv_lvbench(args) -> None:
+    """DIAGNOSTIC, not a headline: 5-fold cross-validation on LVBench's own videos.
+
+    Every question is scored by a head that never saw its video, as query or as
+    frames. It separates the two ways stage 2 can fail: if in-domain labels let
+    frozen SigLIP features localize LVBench evidence, the barrier is the training
+    data; if they do not, it is the representation."""
+    run_dir = os.path.join(RUNS, args.run)
+    os.makedirs(run_dir, exist_ok=True)
+    text = Text()
+    bank, items, keys = lvbench_setup()
+    vids = sorted({it["key"] for it in items})
+    random.Random(args.seed).shuffle(vids)
+    folds = [set(vids[k::args.folds]) for k in range(args.folds)]
+    per_all: dict[str, list] = {}
+    for k, test_v in enumerate(folds):
+        if args.init:
+            model, _ = load_head(args.init)
+        else:
+            model = T1Head(d=args.d, layers=args.layers, dropout=args.dropout,
+                           use_grid=not args.no_grid).cuda()
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+        by_vid: dict[str, list[int]] = {}
+        for j, it in enumerate(items):
+            if it["key"] not in test_v:
+                by_vid.setdefault(it["key"], []).append(j)
+        rng = random.Random(args.seed * 7 + k)
+        train_v = sorted(by_vid)
+        model.train()
+        for step in range(args.steps):
+            v = rng.choice(train_v)
+            sub = rng.sample(by_vid[v], min(16, len(by_vid[v])))
+            feats = video_feats(bank, v, len(sub))
+            T = feats.shape[1]
+            label = torch.zeros(len(sub), T, dtype=torch.bool, device="cuda")
+            for r, j in enumerate(sub):
+                lo, hi = span_seconds(items[j]["span"][0], items[j]["span"][1], T)
+                label[r, lo:hi] = True
+            qtok, qmask, qpool = text_inputs(text, [keys[j] for j in sub])
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                prior = zero_shot_logits(feats[:, :, 0], qpool, text.scale, text.bias)
+                loss = loss_fn(model(feats, qtok, qmask, prior), label)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+        model.eval()
+        te = [j for j, it in enumerate(items) if it["key"] in test_v]
+        per, _ = score_lvbench(model, text, bank, [items[j] for j in te],
+                               [keys[j] for j in te], 13 + k)
+        for arm, recs in per.items():
+            per_all.setdefault(arm, []).extend(recs)
+        print(f"  fold {k}: {len(te)} questions, {len(test_v)} videos | head AUROC(hard) "
+              f"{summarize(per['head'])['auroc_hard']:.3f} | zero-shot "
+              f"{summarize(per['zeroshot'])['auroc_hard']:.3f}", flush=True)
+    res = {arm: summarize(recs) for arm, recs in per_all.items()}
+    with open(os.path.join(run_dir, "lvbench_cv.json"), "w", encoding="utf-8") as fh:
+        json.dump({"folds": args.folds, "steps": args.steps, "init": args.init,
+                   "result": res}, fh, indent=1)
+    print(f"\n=== LVBench {args.folds}-fold CV, by video (init={args.init or 'scratch'}) ===")
+    report({"lvbench_cv": {"all folds": res}})
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--phase", choices=["train", "eval_lvbench"], required=True)
+    ap.add_argument("--phase", choices=["train", "eval_lvbench", "cv_lvbench"],
+                    required=True)
     ap.add_argument("--run", required=True)
     ap.add_argument("--corpora", nargs="+", default=["charades", "anet"])
     ap.add_argument("--tau", nargs="+", default=["charades=0.80", "anet=0.85"],
@@ -371,11 +459,10 @@ def main() -> None:
     ap.add_argument("--qdrop", type=float, default=0.1)
     ap.add_argument("--no_grid", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--folds", type=int, default=5, help="cv_lvbench only")
+    ap.add_argument("--init", default="", help="cv_lvbench: start from this checkpoint")
     args = ap.parse_args()
-    if args.phase == "train":
-        train(args)
-    else:
-        eval_lvbench(args)
+    {"train": train, "eval_lvbench": eval_lvbench, "cv_lvbench": cv_lvbench}[args.phase](args)
 
 
 if __name__ == "__main__":
