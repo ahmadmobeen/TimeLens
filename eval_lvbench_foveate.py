@@ -303,6 +303,12 @@ def main() -> None:
     n_done = skipped = correct = unparsed = 0
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
+    # The reference call depends only on the video, and questions arrive grouped by
+    # video (~15 each), so it is decoded once per video rather than once per question.
+    # Same tensors, same metadata: a speedup, not a protocol change.
+    ref_memo: dict[str, tuple] = {}
+    vr_memo: dict = {}
+
     with open(args.out, "a", encoding="utf-8") as out_fh:
         for item in items:
             key = f"{item['key']}>>>{item['uid']}"
@@ -311,13 +317,16 @@ def main() -> None:
             try:
                 # 1) Reference call at the frame budget: fixes N and the per-frame
                 #    resolution. Both arms inherit them, so only placement differs.
-                ref_msgs = [{"role": "user", "content": [
-                    {"type": "video", "video": item["video_path"],
-                     "nframes": args.n_frames, "min_pixels": 64 * 28 * 28,
-                     "total_pixels": 14336 * 28 * 28},
-                    {"type": "text", "text": "x"}]}]
-                _, ref_videos = process_vision_info(ref_msgs, return_video_metadata=True)
-                ref_tensor, meta = ref_videos[0]
+                if item["video_path"] not in ref_memo:
+                    ref_msgs = [{"role": "user", "content": [
+                        {"type": "video", "video": item["video_path"],
+                         "nframes": args.n_frames, "min_pixels": 64 * 28 * 28,
+                         "total_pixels": 14336 * 28 * 28},
+                        {"type": "text", "text": "x"}]}]
+                    _, ref_videos = process_vision_info(ref_msgs, return_video_metadata=True)
+                    ref_memo.clear()
+                    ref_memo[item["video_path"]] = ref_videos[0]
+                ref_tensor, meta = ref_memo[item["video_path"]]
                 n, _, H, W = ref_tensor.shape
                 native_fps = float(meta["fps"])
                 total = int(meta["total_num_frames"])
@@ -344,7 +353,9 @@ def main() -> None:
                     times = curve_times(curves[curve_of[key]], dur, n, args.alloc,
                                         args.tau, args.eps)
                 idx = times_to_indices(times, native_fps, total, n)
-                vr = VideoReader(item["video_path"])
+                if vr_memo.get("path") != item["video_path"]:   # one reader per video
+                    vr_memo.update(path=item["video_path"], vr=VideoReader(item["video_path"]))
+                vr = vr_memo["vr"]
 
                 if args.arm == "topk_siglip":
                     # Score a denser uniform scan, keep the n best frames. This is the
