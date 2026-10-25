@@ -295,6 +295,10 @@ def main() -> None:
             args.prior_model, torch_dtype=torch.float16).to("cuda").eval()
         print(f"prior encoder: {args.prior_model}", flush=True)
 
+    letter_ids = [processor.tokenizer.encode(c, add_special_tokens=False) for c in "ABCD"]
+    assert all(len(t) == 1 for t in letter_ids), letter_ids
+    letter_ids = [t[0] for t in letter_ids]
+
     realized: list[float] = []
     n_done = skipped = correct = unparsed = 0
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -384,10 +388,15 @@ def main() -> None:
                 else:
                     inputs = processor(text=[text], images=None, videos=[(frames, vmeta)],
                                        padding=True, return_tensors="pt").to("cuda")
-                out_ids = model.generate(**inputs, do_sample=False, temperature=None,
-                                         top_p=None, top_k=None, max_new_tokens=16)
+                gen = model.generate(**inputs, do_sample=False, temperature=None,
+                                     top_p=None, top_k=None, max_new_tokens=16,
+                                     output_scores=True, return_dict_in_generate=True)
+                out_ids = gen.sequences
                 reply = processor.batch_decode(
                     [out_ids[0][inputs.input_ids.shape[-1]:]], skip_special_tokens=True)[0]
+                # The answer distribution at the first generated token: the answerer's own
+                # confidence, logged so it can serve as a sensor (greedy output unchanged).
+                p_letters = torch.softmax(gen.scores[0][0].float()[letter_ids], 0).tolist()
             except Exception as ex:  # one bad video must not kill the run
                 skipped += 1
                 print(f"  [skip {skipped}] {item['key']} | {ex!r}", flush=True)
@@ -414,7 +423,8 @@ def main() -> None:
                 "prior_abs_err_s": prior_err,
                 "span": item["span"], "duration_s": dur, "n_frames": len(idx),
                 "in_span": sum(item["span"][0] - 0.5 <= i / native_fps <= item["span"][1] + 0.5
-                               for i in idx)}) + "\n")
+                               for i in idx),
+                "p_letters": [round(p, 5) for p in p_letters]}) + "\n")
             out_fh.flush()
             if n_done % 50 == 0:
                 print(f"  [{n_done}/{len(items)}] acc {correct / n_done:.4f} "
