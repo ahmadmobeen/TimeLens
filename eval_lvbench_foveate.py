@@ -294,6 +294,15 @@ def main() -> None:
     new_video_api = getattr(processor, "video_processor", None) is not None
     print(f"processor={type(processor).__name__} "
           f"contract={'video_metadata kwarg' if new_video_api else 'legacy tuple'}", flush=True)
+    # Thinking-capable templates (Qwen3.5) open the reply with a reasoning block, but the reply
+    # is capped at 16 new tokens and parsed for a letter, and p_letters is read at the first
+    # generated token. Only a template that exposes the switch receives it, so every other
+    # answerer's prompt is byte-identical to before.
+    chat_kwargs = ({"enable_thinking": False}
+                   if "enable_thinking" in str(getattr(processor, "chat_template", None) or "")
+                   else {})
+    if chat_kwargs:
+        print(f"chat template kwargs: {chat_kwargs}", flush=True)
     model = AutoModelForImageTextToText.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
         device_map="cuda", trust_remote_code=True).eval()
@@ -430,7 +439,7 @@ def main() -> None:
                     {"type": "text", "text": PROMPT.format(item["question"],
                                                           letter_list(item["n_opts"]))}]}]
                 text = processor.apply_chat_template(messages, tokenize=False,
-                                                     add_generation_prompt=True)
+                                                     add_generation_prompt=True, **chat_kwargs)
                 if new_video_api:
                     inputs = processor(text=[text], images=None, videos=[frames],
                                        video_metadata=[vmeta], do_sample_frames=False,
