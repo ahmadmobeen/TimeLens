@@ -102,18 +102,19 @@ def qwen3_embed(model, inputs: dict) -> torch.Tensor:
 
 
 class Chunks(Dataset):
-    def __init__(self, vids: list[tuple[str, int]], proc, model_id: str = "", chunk: int = CHUNK):
+    def __init__(self, vids: list[tuple[str, int]], proc, model_id: str = "", chunk: int = CHUNK,
+                 bench: str = "lvbench"):
         self.items = [(v, a, min(a + chunk, n)) for v, n in vids for a in range(0, n, chunk)]
-        self.proc, self.model_id = proc, model_id
+        self.proc, self.model_id, self.bench = proc, model_id, bench
 
     def __len__(self) -> int:
         return len(self.items)
 
     def __getitem__(self, i: int):
         vid, a, b = self.items[i]
-        with open(os.path.join(FRAMES, "lvbench", vid + ".json"), encoding="utf-8") as fh:
+        with open(os.path.join(FRAMES, self.bench, vid + ".json"), encoding="utf-8") as fh:
             off = json.load(fh)["off"]
-        with open(os.path.join(FRAMES, "lvbench", vid + ".bin"), "rb") as fh:
+        with open(os.path.join(FRAMES, self.bench, vid + ".bin"), "rb") as fh:
             fh.seek(off[a])
             blob = fh.read(off[b] - off[a])
         imgs = [Image.open(io.BytesIO(blob[off[k] - off[a]:off[k + 1] - off[a]])).convert("RGB")
@@ -125,18 +126,20 @@ class Chunks(Dataset):
         return px, (vid, a, b)
 
 
-def encode_images(model, proc, out_dir: str, workers: int, model_id: str = "") -> dict[str, np.ndarray]:
-    path = os.path.join(out_dir, "lvbench_img.npz")
+def encode_images(model, proc, out_dir: str, workers: int, model_id: str = "",
+                  bench: str = "lvbench") -> dict[str, np.ndarray]:
+    path = os.path.join(out_dir, f"{bench}_img.npz")
     if os.path.exists(path):
         with np.load(path) as z:
             return {k: z[k] for k in z.files}
     vids = []
-    for name in sorted(os.listdir(os.path.join(FRAMES, "lvbench"))):
-        if name.endswith(".json"):
-            with open(os.path.join(FRAMES, "lvbench", name), encoding="utf-8") as fh:
+    for name in sorted(os.listdir(os.path.join(FRAMES, bench))):     # local cache, not /gpfs
+        if name.endswith(".json") and name != "failures.json":
+            with open(os.path.join(FRAMES, bench, name), encoding="utf-8") as fh:
                 vids.append((name[:-5], len(json.load(fh)["t"])))
     q3 = is_qwen3_emb(model_id)
-    loader = DataLoader(Chunks(vids, proc, model_id, chunk=32 if q3 else CHUNK), batch_size=None,
+    loader = DataLoader(Chunks(vids, proc, model_id, chunk=32 if q3 else CHUNK, bench=bench),
+                        batch_size=None,
                         num_workers=workers, prefetch_factor=2)
     acc: dict[str, list] = {}
     done = 0
@@ -163,14 +166,23 @@ def query_forms(q: str) -> tuple[str, list[str]]:
     return stem, opts
 
 
-def nll_cv(curves: list[np.ndarray], spans: list[tuple[int, int]], vids: list[str]) -> tuple[float, float]:
+def nll_cv(curves: list[np.ndarray], spans: list, vids: list[str]) -> tuple[float, float]:
+    """5-fold (by video) CV temperature and held-out NLL of the evidence location.
+    `spans[i]` is (lo, hi) or a list of them; the evidence is their union."""
     taus = np.exp(np.linspace(np.log(0.3), np.log(30), 40))
-    def nll(z, lo, hi, t):
+    masks = []
+    for z, sp in zip(curves, spans):
+        m = np.zeros(len(z), bool)
+        for lo, hi in ([sp] if isinstance(sp[0], (int, np.integer)) else sp):
+            m[lo:hi] = True
+        masks.append(m)
+
+    def nll(z, m, t):
         x = z / t
-        m, ms = x.max(), x[lo:hi].max()
-        return m + np.log(np.exp(x - m).sum()) - ms - np.log(np.exp(x[lo:hi] - ms).sum())
-    tab = np.array([[nll(z.astype(np.float64), lo, hi, t) for t in taus]
-                    for z, (lo, hi) in zip(curves, spans)])
+        mx, ms = x.max(), x[m].max()
+        return mx + np.log(np.exp(x - mx).sum()) - ms - np.log(np.exp(x[m] - ms).sum())
+    tab = np.array([[nll(z.astype(np.float64), m, t) for t in taus]
+                    for z, m in zip(curves, masks)])
     u = sorted(set(vids))
     random.Random(0).shuffle(u)
     fold = {v: i % 5 for i, v in enumerate(u)}
@@ -189,6 +201,8 @@ def main() -> None:
     ap.add_argument("--model", required=True)
     ap.add_argument("--name", required=True)
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--bench", default="lvbench",
+                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench"])
     args = ap.parse_args()
     from transformers import AutoModel, AutoProcessor
     out_dir = os.path.join("data/t1/priors", args.name)
@@ -202,14 +216,29 @@ def main() -> None:
         model = AutoModel.from_pretrained(args.model, dtype=torch.float16).to("cuda").eval()
         scale = float(model.logit_scale.exp()) if hasattr(model, "logit_scale") else 100.0
         bias = float(model.logit_bias) if getattr(model, "logit_bias", None) is not None else 0.0
-    feats = encode_images(model, proc, out_dir, args.workers, args.model)
+    feats = encode_images(model, proc, out_dir, args.workers, args.model, args.bench)
 
-    items = [i for i in lvbench_items() if i["key"] in feats]
+    if args.bench == "lvbench":                  # the exact LVBench path, unchanged
+        items = []
+        for i in lvbench_items():
+            if i["key"] in feats:
+                stem, opts = query_forms(i["question"])
+                items.append({"vid": i["key"], "qkey": f"lvbench:{i['key']}>>>{i['uid']}",
+                              "stem": stem, "opts": opts, "spans": [tuple(i["span"])],
+                              "duration": i["duration"], "center": i["center"]})
+    else:
+        import bench as _bench
+        items = []
+        for q in _bench.load(args.bench):
+            if q.vid in feats:
+                sp = list(q.spans)
+                items.append({"vid": q.vid, "qkey": q.key, "stem": q.stem, "opts": list(q.options),
+                              "spans": sp, "duration": q.duration or float(len(feats[q.vid])),
+                              "center": (sp[0][0] + sp[0][1]) / 2 if sp else None})
     texts, index = [], []
     for it in items:
-        stem, opts = query_forms(it["question"])
-        index.append((len(texts), len(opts)))
-        texts += [stem] + [f"{stem} {o}" for o in opts]
+        index.append((len(texts), len(it["opts"])))
+        texts += [it["stem"]] + [f"{it['stem']} {o}" for o in it["opts"]]
     emb = []
     for i in range(0, len(texts), 256):
         if q3:
@@ -225,30 +254,41 @@ def main() -> None:
 
     res = {"stem": [], "max(stem+opt_k)": []}
     curves = {"stem": [], "max(stem+opt_k)": []}
-    spans = []
+    all_curves = {"stem": {}, "max(stem+opt_k)": {}}
+    spans, vids = [], []
     for it, (s, n) in zip(items, index):
-        x = feats[it["key"]].astype(np.float32)
+        x = feats[it["vid"]].astype(np.float32)
         zs = x @ emb[s] * scale + bias
         zo = (x @ emb[s + 1:s + 1 + n].T * scale + bias).max(1)
-        lo, hi = span_seconds(it["span"][0], it["span"][1], len(x))
-        spans.append((lo, hi))
+        all_curves["stem"][it["qkey"]], all_curves["max(stem+opt_k)"][it["qkey"]] = zs, zo
+        if not it["spans"]:
+            continue                             # no evidence labels: curves only
+        sp = [span_seconds(a, b, len(x)) for a, b in it["spans"]]
+        spans.append(sp)
+        vids.append(it["vid"])
         for k, z in (("stem", zs), ("max(stem+opt_k)", zo)):
             curves[k].append(z)
             res[k].append({"windows": window_scores(z, it["duration"], it["center"]),
-                           "dist": dist_to_span(z, lo, hi)})
-    vids = [it["key"] for it in items]
-    print(f"\n=== prior: {args.name} ({args.model}), n = {len(items)} ===")
+                           "dist": min(dist_to_span(z, lo, hi) for lo, hi in sp)})
+    tag = "" if args.bench == "lvbench" else f"{args.bench}_"
+    for k, name in (("max(stem+opt_k)", "curves_maxopt"), ("stem", "curves_stem")):
+        np.savez(os.path.join(out_dir, f"{tag}{name}.npz"),
+                 **{q: z.astype(np.float16) for q, z in all_curves[k].items()})
+    print(f"\n=== prior: {args.name} ({args.model}) on {args.bench}: {len(items)} questions, "
+          f"{len(spans)} with evidence labels ===")
+    if not spans:
+        print("  no evidence labels on this benchmark: curves written, no localization metrics",
+              flush=True)
+        return
     print(f"{'query form':<18}{'paired':>8}{'R@1':>8}{'w60':>8}{'median':>8}{'tau*':>7}{'NLL':>7}")
     for k, recs in res.items():
         s = summarize(recs)
         tau, nll = nll_cv(curves[k], spans, vids)
         print(f"{k:<18}{s['paired_win']:>8.3f}{s['recall_at_1']:>8.3f}{s['within_60s']:>8.3f}"
               f"{s['median_dist']:>8.0f}{tau:>7.2f}{nll:>7.3f}")
-    np.savez(os.path.join(out_dir, "curves_maxopt.npz"),
-             **{f"lvbench:{it['key']}>>>{it['uid']}": z.astype(np.float16)
-                for it, z in zip(items, curves["max(stem+opt_k)"])})
-    print("  reference, SigLIP so400m: stem paired 0.722 / R@1 0.401 / w60 0.374 / NLL 4.340;"
-          " max-option 0.774 / 0.471 / 0.411 / 3.937", flush=True)
+    if args.bench == "lvbench":
+        print("  reference, SigLIP so400m: stem paired 0.722 / R@1 0.401 / w60 0.374 / NLL 4.340;"
+              " max-option 0.774 / 0.471 / 0.411 / 3.937", flush=True)
 
 
 if __name__ == "__main__":

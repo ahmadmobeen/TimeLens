@@ -48,11 +48,17 @@ MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 PROMPT = (
     "{}\n\n"
-    "Answer with the single letter of the correct option (A, B, C or D) and nothing else."
+    "Answer with the single letter of the correct option ({}) and nothing else."
 )
+LETTERS = "ABCDEFGH"
+
+
+def letter_list(n: int) -> str:
+    """"A, B, C or D" for 4 options -- the original LVBench wording, exactly."""
+    return ", ".join(LETTERS[:n - 1]) + " or " + LETTERS[n - 1]
 
 _TR = re.compile(r"^(\d+):(\d+)(?::(\d+))?-(\d+):(\d+)(?::(\d+))?$")
-_LETTER = re.compile(r"\b([ABCD])\b")
+_LETTER = {n: re.compile(rf"\b([{LETTERS[:n]}])\b") for n in range(2, len(LETTERS) + 1)}
 
 # Abort an arm after this many failures with nothing scored (broken harness).
 FAIL_FAST_SKIPS = 25
@@ -74,9 +80,10 @@ def parse_time_reference(text: str) -> tuple[float, float] | None:
     return float(start), float(end)
 
 
-def parse_letter(answer: str) -> str | None:
-    """First standalone A/B/C/D in the model's reply, else None (counted, not guessed)."""
-    m = _LETTER.search(answer.upper())
+def parse_letter(answer: str, n_opts: int = 4) -> str | None:
+    """First standalone valid option letter in the reply, else None (counted, not guessed).
+    For 4 options this is the original A/B/C/D rule."""
+    m = _LETTER[n_opts].search(answer.upper())
     return m.group(1) if m else None
 
 
@@ -226,6 +233,9 @@ def main() -> None:
     ap.add_argument("--curve_placebo", action="store_true",
                     help="curve arm PLACEBO: allocate with ANOTHER question's curve from the "
                          "SAME video -- same video, same allocator, wrong question")
+    ap.add_argument("--bench", default="lvbench",
+                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench"],
+                    help="question set; non-LVBench sets come through bench.py")
     ap.add_argument("--seed", type=int, default=0,
                     help="fixes the --shuffle_query rotation")
     ap.add_argument("--limit", type=int, default=0, help="smoke-test on the first N questions")
@@ -235,7 +245,24 @@ def main() -> None:
                          "which covers only a handful of videos")
     args = ap.parse_args()
 
-    items, census = load_questions(args.parquet, args.meta, args.video_dir)
+    if args.bench == "lvbench":
+        items, census = load_questions(args.parquet, args.meta, args.video_dir)
+        for it in items:
+            it.update(rkey=f"{it['key']}>>>{it['uid']}", qkey=f"lvbench:{it['key']}>>>{it['uid']}",
+                      n_opts=4, spans=[it["span"]])
+    else:
+        import bench as _bench
+        items = []
+        for q in _bench.load(args.bench):
+            spans = [list(sp) for sp in q.spans]
+            dur = float(q.duration or 0.0)
+            items.append({"key": q.vid, "uid": q.key, "video_path": q.video_path,
+                          "question": q.prompt_question(), "gold": q.gold, "duration": dur,
+                          "center": (spans[0][0] + spans[0][1]) / 2 if spans else dur / 2,
+                          "span": spans[0] if spans else None, "spans": spans,
+                          "rkey": q.key, "qkey": q.key, "n_opts": len(q.options)})
+        census = {"bench": args.bench, "scoreable": len(items),
+                  "videos": len({it["key"] for it in items})}
     print(f"population: {census}", flush=True)
     if args.sample:
         import random as _rs
@@ -286,13 +313,14 @@ def main() -> None:
         import numpy as np
         curves = np.load(args.curves)
         by_video: dict[str, list[str]] = {}
+        qkey_of = {it["rkey"]: it["qkey"] for it in items}
         for it in items:
-            by_video.setdefault(it["key"], []).append(f"{it['key']}>>>{it['uid']}")
+            by_video.setdefault(it["key"], []).append(it["rkey"])
         for keys in by_video.values():
             assert len(keys) >= 2 or not args.curve_placebo, keys
             for i, k in enumerate(keys):         # placebo: the next question, same video
                 src = keys[(i + 1) % len(keys)] if args.curve_placebo else k
-                curve_of[k] = "lvbench:" + src
+                curve_of[k] = qkey_of[src]
         print(f"curves: {args.curves} alloc={args.alloc} tau={args.tau} eps={args.eps}"
               f"{' PLACEBO (same video, other question)' if args.curve_placebo else ''}",
               flush=True)
@@ -305,7 +333,7 @@ def main() -> None:
             args.prior_model, torch_dtype=torch.float16).to("cuda").eval()
         print(f"prior encoder: {args.prior_model}", flush=True)
 
-    letter_ids = [processor.tokenizer.encode(c, add_special_tokens=False) for c in "ABCD"]
+    letter_ids = [processor.tokenizer.encode(c, add_special_tokens=False) for c in LETTERS]
     assert all(len(t) == 1 for t in letter_ids), letter_ids
     letter_ids = [t[0] for t in letter_ids]
 
@@ -321,7 +349,7 @@ def main() -> None:
 
     with open(args.out, "a", encoding="utf-8") as out_fh:
         for item in items:
-            key = f"{item['key']}>>>{item['uid']}"
+            key = item["rkey"]
             if key in done:
                 continue
             try:
@@ -399,7 +427,8 @@ def main() -> None:
                 # 3) Ask the multiple-choice question over exactly those frames.
                 messages = [{"role": "user", "content": [
                     {"type": "video", "video": item["video_path"]},
-                    {"type": "text", "text": PROMPT.format(item["question"])}]}]
+                    {"type": "text", "text": PROMPT.format(item["question"],
+                                                          letter_list(item["n_opts"]))}]}]
                 text = processor.apply_chat_template(messages, tokenize=False,
                                                      add_generation_prompt=True)
                 if new_video_api:
@@ -417,7 +446,8 @@ def main() -> None:
                     [out_ids[0][inputs.input_ids.shape[-1]:]], skip_special_tokens=True)[0]
                 # The answer distribution at the first generated token: the answerer's own
                 # confidence, logged so it can serve as a sensor (greedy output unchanged).
-                p_letters = torch.softmax(gen.scores[0][0].float()[letter_ids], 0).tolist()
+                p_letters = torch.softmax(
+                    gen.scores[0][0].float()[letter_ids[:item["n_opts"]]], 0).tolist()
             except Exception as ex:  # one bad video must not kill the run
                 skipped += 1
                 print(f"  [skip {skipped}] {item['key']} | {ex!r}", flush=True)
@@ -432,7 +462,7 @@ def main() -> None:
                     ) from ex
                 continue
 
-            pred = parse_letter(reply)
+            pred = parse_letter(reply, item["n_opts"])
             if pred is None:
                 unparsed += 1
             is_correct = pred is not None and pred == item["gold"]
@@ -443,8 +473,8 @@ def main() -> None:
                 "correct": is_correct, "raw": reply.strip()[:80], "center_s": center,
                 "prior_abs_err_s": prior_err,
                 "span": item["span"], "duration_s": dur, "n_frames": len(idx),
-                "in_span": sum(item["span"][0] - 0.5 <= i / native_fps <= item["span"][1] + 0.5
-                               for i in idx),
+                "in_span": (sum(any(a - 0.5 <= i / native_fps <= b + 0.5 for a, b in item["spans"])
+                                for i in idx) if item["spans"] else None),
                 "p_letters": [round(p, 5) for p in p_letters]}) + "\n")
             out_fh.flush()
             if n_done % 50 == 0:

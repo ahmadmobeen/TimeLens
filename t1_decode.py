@@ -18,6 +18,10 @@ The .json is written last, by rename, so a present .json means a complete video.
 
 Run:
   .venv/bin/python -u t1_decode.py --src lvbench charades anet --workers 48
+  .venv/bin/python -u t1_decode.py --src videomme lvb mlvu cgbench --workers 32
+
+The evaluation benchmarks (Video-MME, LongVideoBench, MLVU, CG-Bench) come through
+bench.py; their sources are read from /gpfs by exact path, never by listing.
 """
 from __future__ import annotations
 
@@ -37,6 +41,8 @@ ANET = "data/charades_full/anet_train_natural.json"
 OUT = "data/t1/frames"
 SHORT, LONG_CAP, QUALITY = 360, 640, 85
 
+EVAL_BENCHES = ("videomme", "lvb", "mlvu", "cgbench")   # loaded through bench.py
+
 # Abort when this many videos have failed and none has succeeded (broken setup).
 FAIL_FAST = 20
 
@@ -54,6 +60,13 @@ def sources(names: list[str]) -> list[tuple[str, str, str]]:
             with open(ann, encoding="utf-8") as fh:
                 paths = sorted({r["video_path"] for r in json.load(fh)})
             jobs += [(src, os.path.splitext(os.path.basename(p))[0], p) for p in paths]
+    for src in names:                     # evaluation benchmarks, via the shared loaders
+        if src in EVAL_BENCHES:
+            import bench
+            first = {}
+            for it in bench.load(src):
+                first.setdefault(it.vid, it.video_path)
+            jobs += [(src, v, p) for v, p in sorted(first.items())]
     return jobs
 
 
@@ -110,8 +123,8 @@ def decode(job: tuple[str, str, str]) -> tuple[str, str, int, str | None]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--src", nargs="+", choices=["lvbench", "charades", "anet"],
-                    required=True)
+    ap.add_argument("--src", nargs="+",
+                    choices=["lvbench", "charades", "anet", *EVAL_BENCHES], required=True)
     ap.add_argument("--workers", type=int, default=48)
     args = ap.parse_args()
 
