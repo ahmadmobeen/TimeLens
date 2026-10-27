@@ -5,7 +5,7 @@
 import collections, json, sys
 import numpy as np
 import bench
-from nsp5_compare import boot_ci
+from nsp5_compare import boot_ci, video_of
 
 def load(p):
     return {json.loads(l)["key"]: json.loads(l)["correct"] for l in open(p)}
@@ -14,7 +14,7 @@ def report(ref_path, arm_path, keys=None, label=""):
     ref, arm = load(ref_path), load(arm_path)
     ks = [k for k in ref if k in arm and (keys is None or k in keys)]
     r = np.array([ref[k] for k in ks], float); a = np.array([arm[k] for k in ks], float)
-    d = a - r; lo, hi = boot_ci(d)
+    d = a - r; lo, hi = boot_ci(d, groups=[video_of(k) for k in ks])
     print(f"  {label:10s} n={len(ks):5d}  ref {100*r.mean():5.2f}  arm {100*a.mean():5.2f}  diff {100*d.mean():+5.2f} [{100*lo:+.2f}, {100*hi:+.2f}]")
 
 if __name__ == "__main__":

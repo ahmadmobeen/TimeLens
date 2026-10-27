@@ -1,8 +1,11 @@
 """Compare LVBench arms question by question (NS-P5).
 
 Every arm is a JSONL from eval_lvbench_foveate.py. Differences are PAIRED: the same
-question under two arms, with a 95 % bootstrap CI over questions, so an arm is not
-credited for the luck of which questions it got right.
+question under two arms, so an arm is not credited for the luck of which questions it got
+right. The 95 % bootstrap CI resamples whole VIDEOS (CONVENTIONS section 7): one video
+contributes several questions, and resampling questions alone understates the interval
+(LVBench: ~15 questions per video). --cluster question gives the per-question interval
+NS-P5 reported before 2026-10-27.
 
   .venv/bin/python nsp5_compare.py --ref logs/nsp5/b1_topk_siglip.jsonl \\
       logs/nsp5/e3_uniform.jsonl logs/nsp5/a1_topk.jsonl ...
@@ -28,9 +31,34 @@ def load(path: str) -> dict[str, dict]:
         return {r["key"]: r for r in map(json.loads, fh) if r}
 
 
-def boot_ci(diff: np.ndarray, n: int = 5000, seed: int = 0) -> tuple[float, float]:
+_VID: dict[str, str] = {}
+
+
+def video_of(key: str) -> str:
+    """The video a question belongs to. LVBench keys are '<video>>>><uid>'; bench.py keys are
+    '<bench>:<id>' and are looked up in bench.load(<bench>)."""
+    if ">>>" in key:
+        return key.split(">>>")[0]
+    if key not in _VID:
+        import bench
+        _VID.update({it.key: it.vid for it in bench.load(key.split(":", 1)[0])})
+    return _VID[key]
+
+
+def boot_ci(diff: np.ndarray, n: int = 5000, seed: int = 0,
+            groups=None) -> tuple[float, float]:
+    """95 % percentile interval of the mean paired difference. With `groups` (one label per
+    question, e.g. its video) whole groups are resampled, the cluster bootstrap of CONVENTIONS
+    section 7; without, single questions are."""
     rng = np.random.default_rng(seed)
-    means = rng.choice(diff, size=(n, len(diff)), replace=True).mean(1)
+    diff = np.asarray(diff, float)
+    if groups is None:
+        means = rng.choice(diff, size=(n, len(diff)), replace=True).mean(1)
+    else:
+        _, inv = np.unique(np.asarray(groups), return_inverse=True)
+        sums, cnts = np.bincount(inv, weights=diff), np.bincount(inv).astype(float)
+        idx = rng.integers(0, len(sums), size=(n, len(sums)))
+        means = sums[idx].sum(1) / cnts[idx].sum(1)
     return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
 
@@ -39,6 +67,8 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ref", required=True, help="reference arm for paired differences")
     ap.add_argument("arms", nargs="+")
+    ap.add_argument("--cluster", choices=["video", "question"], default="video",
+                    help="bootstrap unit for the CI (CONVENTIONS section 7: video)")
     args = ap.parse_args()
 
     import pandas as pd
@@ -50,8 +80,9 @@ def main() -> None:
     for a in arms.values():
         common &= set(a)
     keys = sorted(common)
+    groups = [video_of(k) for k in keys] if args.cluster == "video" else None
     print(f"{len(keys)} questions common to all arms and the reference "
-          f"({os.path.basename(args.ref)})\n")
+          f"({os.path.basename(args.ref)}); CI: paired bootstrap by {args.cluster}\n")
 
     rc = np.array([ref[k]["correct"] for k in keys], float)
     print(f"{'arm':<22}{'acc':>8}{'vs ref':>9}{'95% CI':>18}{'win/loss':>11}"
@@ -60,7 +91,7 @@ def main() -> None:
     for name, a in arms.items():
         c = np.array([a[k]["correct"] for k in keys], float)
         d = c - rc
-        lo, hi = boot_ci(d)
+        lo, hi = boot_ci(d, groups=groups)
         ins = [a[k].get("in_span") for k in keys]
         has = all(x is not None for x in ins)
         ins_s = f"{np.mean(ins):>9.1f}{np.mean(np.array(ins) == 0) * 100:>6.0f}%" if has else ""
@@ -79,11 +110,11 @@ def main() -> None:
             row += f"{np.mean([a[k]['correct'] for k, mm in zip(keys, m) if mm]) * 100:>14.1f}"
         print(row)
 
-    types = sorted({t for k in keys for t in qtype[k].split("/")})
+    types = sorted({t for k in keys for t in qtype.get(k, "").split("/") if t})
     print(f"\nby question type (a question can carry several types)")
     print(f"{'type':<28}{'n':>6}{'ref':>8}" + "".join(f"{n[:12]:>14}" for n in arms))
     for t in types:
-        m = np.array([t in qtype[k].split("/") for k in keys])
+        m = np.array([t in qtype.get(k, "").split("/") for k in keys])
         row = f"{t[:27]:<28}{m.sum():>6}{rc[m].mean() * 100:>8.1f}"
         for a in arms.values():
             row += f"{np.mean([a[k]['correct'] for k, mm in zip(keys, m) if mm]) * 100:>14.1f}"
