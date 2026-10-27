@@ -27,6 +27,11 @@ fused() { echo "data/t1/priors/fused_siglip_q8b/$1_curves_maxopt.npz"; }
 
 arms() {  # name|bench|venv|prerequisite curves|eval args
   local b
+  # X1 amendment 2: the 8B scorer with options under Kelly (its own CV temperature 3.58)
+  echo "q8_kelly|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5"
+  for b in videomme lvb mlvu cgbench; do
+    echo "x1_${b}_q8_kelly|$b|.venv|$(q8b $b)|--arm curve --curves $(q8b $b) --alloc kelly --tau 3.58 --eps 0.5"
+  done
   for b in videomme lvb mlvu cgbench; do
     echo "x1_${b}_a3_kelly|$b|.venv|$(fused $b)|--arm curve --curves $(fused $b) --alloc kelly --tau 1.76 --eps 0.5"
     echo "x1_${b}_b1|$b|.venv||--arm topk_siglip"

@@ -17,9 +17,10 @@ import time
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 L = "logs/nsp5"
 TOT = {"videomme": 2700, "lvb": 1337, "mlvu": 2174, "cgbench": 3000}
-ARMS = {"g2_q35_b1": 1534, "x1_cgbench_a3_kelly_placebo": 2683}  # placebo: multi-question videos only
+ARMS = {"g2_q35_b1": 1534, "x1_cgbench_a3_kelly_placebo": 2683,  # placebo: multi-question videos only
+        "q8_kelly": 1534}
 for _b, _t in TOT.items():
-    for _a in ("uniform", "b1", "a2_kelly", "a3_kelly", "a3_kelly_q3", "q8opt_topk", "uniform_q3"):
+    for _a in ("uniform", "b1", "a2_kelly", "a3_kelly", "a3_kelly_q3", "q8opt_topk", "uniform_q3", "q8_kelly"):
         ARMS[f"x1_{_b}_{_a}"] = _t
 PAT = re.compile(r"Traceback|Error|Killed|No space")
 SPAT = re.compile(r"fuse|encode|COVERAGE|every arm|torn")
