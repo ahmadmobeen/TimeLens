@@ -326,10 +326,19 @@ def main() -> None:
         for it in items:
             by_video.setdefault(it["key"], []).append(it["rkey"])
         for keys in by_video.values():
-            assert len(keys) >= 2 or not args.curve_placebo, keys
+            if args.curve_placebo and len(keys) < 2:
+                continue                         # no other question about this video
             for i, k in enumerate(keys):         # placebo: the next question, same video
                 src = keys[(i + 1) % len(keys)] if args.curve_placebo else k
                 curve_of[k] = qkey_of[src]
+        if args.curve_placebo:
+            # A video with a single question has no same-video partner, so the placebo is
+            # undefined there (CG-Bench has such videos; LVBench does not). Those questions are
+            # left out of this arm and compared on the questions both arms share.
+            n_all = len(items)
+            items = [it for it in items if it["rkey"] in curve_of]
+            print(f"PLACEBO: skipped {n_all - len(items)} questions from single-question videos; "
+                  f"{len(items)} remain", flush=True)
         print(f"curves: {args.curves} alloc={args.alloc} tau={args.tau} eps={args.eps}"
               f"{' PLACEBO (same video, other question)' if args.curve_placebo else ''}",
               flush=True)

@@ -18,6 +18,8 @@ L=logs/nsp5
 DRY=0; [ "${2:-}" = "--dry-run" ] && DRY=1
 Q3=Qwen/Qwen3-VL-8B-Instruct
 declare -A TOTAL=([videomme]=2700 [lvb]=1337 [mlvu]=2174 [cgbench]=3000 [lvbench]=1534)
+# the same-video placebo skips CG-Bench's 317 single-question videos (no partner question)
+declare -A ARM_TOTAL=([x1_cgbench_a3_kelly_placebo]=2683)
 ts() { date '+%F %T'; }
 sig() { echo "data/t1/priors/siglip_so400m/$1_curves_maxopt.npz"; }
 q8b() { echo "data/t1/priors/qwen3vl_emb_8b/$1_curves_maxopt.npz"; }
@@ -127,7 +129,7 @@ PY
 launch_arms() {
   local name b venv prereq args n t g
   while IFS='|' read -r name b venv prereq args; do
-    n=$(rows "$name"); t=${TOTAL[$b]}
+    n=$(rows "$name"); t=${ARM_TOTAL[$name]:-${TOTAL[$b]}}
     [ "$n" -ge "$t" ] && continue
     running "$name" && continue
     heal "$name"
@@ -149,7 +151,7 @@ launch_arms() {
 case "${1:-}" in
   status)
     while IFS='|' read -r name b venv prereq args; do
-      n=$(rows "$name"); t=${TOTAL[$b]}
+      n=$(rows "$name"); t=${ARM_TOTAL[$name]:-${TOTAL[$b]}}
       if [ "$n" -ge "$t" ]; then s=done; elif running "$name"; then s=running
       elif [ -z "$prereq" ] || [ -e "$prereq" ]; then s=ready; else s="blocked (needs $prereq)"; fi
       printf "%-30s %5s/%-5s %s\n" "$name" "$n" "$t" "$s"
@@ -159,7 +161,7 @@ case "${1:-}" in
       encode_missing_priors; fuse_ready; launch_arms
       [ "$DRY" = 1 ] && break
       left=0
-      while IFS='|' read -r name b venv prereq args; do [ "$(rows "$name")" -lt "${TOTAL[$b]}" ] && left=$((left + 1)); done < <(arms)
+      while IFS='|' read -r name b venv prereq args; do [ "$(rows "$name")" -lt "${ARM_TOTAL[$name]:-${TOTAL[$b]}}" ] && left=$((left + 1)); done < <(arms)
       [ "$left" -eq 0 ] && { echo "$(ts) every arm complete"; break; }
       sleep 300
     done ;;
