@@ -23,6 +23,10 @@ ARMS = {"g2_q35_b1": 1534, "x1_cgbench_a3_kelly_placebo": 2683,  # placebo: mult
 for _b, _t in TOT.items():
     for _a in ("uniform", "b1", "a2_kelly", "a3_kelly", "a3_kelly_q3", "q8opt_topk", "uniform_q3", "q8_kelly", "q8_kelly_q3"):
         ARMS[f"x1_{_b}_{_a}"] = _t
+for _a in ("f2c_kelly", "bolt_its_q8", "aks_ada_q8", "bolt_own", "aks_own", "kelly_clip", "kelly_blip"):
+    ARMS[_a] = 1534                      # prior-art arms, pre-registered 2026-10-28
+    for _b, _t in TOT.items():
+        ARMS[f"x1_{_b}_{_a}"] = _t
 PAT = re.compile(r"Traceback|Error|Killed|No space")
 SPAT = re.compile(r"fuse|encode|COVERAGE|every arm|torn")
 SCHED = f"{L}/x1_scheduler.log"
@@ -58,6 +62,10 @@ def count(path, rx):
 
 def main():
     seen = {n for n, t in ARMS.items() if (rows(n) or 0) >= t}
+    # Report the scheduler only if it stops during the watch; one stopped on purpose (arms split
+    # into shards by hand) would otherwise end every --once watch at once.
+    if subprocess.run(["pgrep", "-f", "nsp5_x1_resume.sh run"], capture_output=True).returncode:
+        seen.add("sched")
     seen |= {f"p{b}" for b in ENCODED if os.path.exists(f"data/t1/priors/qwen3vl_emb_8b/{b}_img.npz")}
     err = {b: count(f"{L}/x1_prior_q8b_{b}_r3.log", PAT) for b in ENCODED}
     sb = count(SCHED, SPAT)

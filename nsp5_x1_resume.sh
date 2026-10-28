@@ -25,8 +25,30 @@ sig() { echo "data/t1/priors/siglip_so400m/$1_curves_maxopt.npz"; }
 q8b() { echo "data/t1/priors/qwen3vl_emb_8b/$1_curves_maxopt.npz"; }
 fused() { echo "data/t1/priors/fused_siglip_q8b/$1_curves_maxopt.npz"; }
 
+tau_of() { python3 -c "import json,sys; print(round(json.load(open(sys.argv[1]))['tau'], 2))" "$1" 2>/dev/null; }
+
 arms() {  # name|bench|venv|prerequisite curves|eval args
-  local b
+  local b pre tag pw q8 cc cl bl tc tb
+  # Prior art in our harness (METHODS-LOG 2026-10-28, pre-registered): F2C's query form, BOLT and
+  # AKS as released, each published rule on M's scores, Kelly on each published scorer. Kelly
+  # temperatures come from the LVBench likelihood fits; an arm whose fit is missing is not listed.
+  tc=$(tau_of data/t1/priors/clip_l14/tau_stem.json)
+  tb=$(tau_of data/t1/priors/blip_itm_l/tau_stem.json)
+  for b in lvbench videomme lvb mlvu cgbench; do
+    pre=""; tag=""; [ $b != lvbench ] && { pre="x1_${b}_"; tag="${b}_"; }
+    pw=3; [ $b = lvb ] && pw=2.5                              # BOLT's script: 2.5 on LongVideoBench
+    q8=data/t1/priors/qwen3vl_emb_8b/${tag}curves_maxopt.npz
+    cc=data/t1/priors/qwen3vl_emb_8b/${tag}curves_concat.npz
+    cl=data/t1/priors/clip_l14/${tag}curves_stem.npz
+    bl=data/t1/priors/blip_itm_l/${tag}curves_stem.npz
+    echo "${pre}f2c_kelly|$b|.venv|$cc|--arm curve --curves $cc --alloc kelly --tau 3.58 --eps 0.5"
+    echo "${pre}bolt_its_q8|$b|.venv|$q8|--arm curve --curves $q8 --alloc its --power $pw"
+    echo "${pre}aks_ada_q8|$b|.venv|$q8|--arm curve --curves $q8 --alloc aks"
+    echo "${pre}bolt_own|$b|.venv|$cl|--arm curve --curves $cl --alloc its --power $pw"
+    echo "${pre}aks_own|$b|.venv|$bl|--arm curve --curves $bl --alloc aks"
+    [ -n "$tc" ] && echo "${pre}kelly_clip|$b|.venv|$cl|--arm curve --curves $cl --alloc kelly --tau $tc --eps 0.5"
+    [ -n "$tb" ] && echo "${pre}kelly_blip|$b|.venv|$bl|--arm curve --curves $bl --alloc kelly --tau $tb --eps 0.5"
+  done
   # confirmation runs for the simplified method M (8B with options, Kelly tau 3.58, eps 0.5)
   echo "q8_kelly_q3|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5 --model $Q3"
   echo "q8_kelly_q35|lvbench|.venv-q35|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5 --model Qwen/Qwen3.5-4B"
@@ -145,6 +167,8 @@ launch_arms() {
     n=$(rows "$name"); t=${ARM_TOTAL[$name]:-${TOTAL[$b]}}
     [ "$n" -ge "$t" ] && continue
     running "$name" && continue
+    # the eval is CPU-bound (~10 cores each, decoding long video): cap the concurrent processes
+    [ "$(pyprocs | grep -c 'eval_lvbench_foveate.py')" -ge "${MAX_EVALS:-16}" ] && return
     heal "$name"
     if [ -n "$prereq" ]; then
       [ -e "$prereq" ] || continue

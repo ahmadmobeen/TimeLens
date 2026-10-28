@@ -87,7 +87,29 @@ def parse_letter(answer: str, n_opts: int = 4) -> str | None:
     return m.group(1) if m else None
 
 
-def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float) -> list[float]:
+def aks_leaves(s, n: int, t1: float, t2: float, depth_max: int) -> list[tuple[int, int, int]]:
+    """AKS's judge-and-split (CVPR 2025; frame_select.meanstd, ported line for line): a segment
+    stops splitting when the mean of its n best scores exceeds its mean by more than t1 (and
+    its std exceeds t2); otherwise it is halved, down to depth_max. Returns (lo, hi, depth)."""
+    import numpy as np
+    leaves, todo = [], [(0, len(s), 0)]
+    while todo:
+        nxt = []
+        for lo, hi, d in todo:
+            seg = s[lo:hi]
+            if np.mean(np.sort(seg)[::-1][:n]) - np.mean(seg) > t1 and np.std(seg) > t2:
+                leaves.append((lo, hi, d))
+            elif d < depth_max:
+                mid = lo + (hi - lo) // 2
+                nxt += [(lo, mid, d + 1), (mid, hi, d + 1)]
+            else:
+                leaves.append((lo, hi, d))
+        todo = nxt
+    return leaves
+
+
+def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float, power: float = 3.0,
+                aks: tuple[float, float, int] = (0.8, -100.0, 5)) -> list[float]:
     """Frame times from a per-second score curve (second k covers [k, k+1)).
 
     topk   the n highest-scoring seconds.
@@ -96,12 +118,44 @@ def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float) -> li
            evidence), as E3's ladder shows, proportional allocation maximises expected
            accuracy; eps of the budget stays uniform as a hedge against a confidently
            wrong posterior (E3's placebo: concentration in the wrong place costs 5 pts).
+    its    BOLT's inverse transform sampling (CVPR 2025; select_frames.py): min-max
+           normalised scores to the power `power`, frames at the linspace(1/n, 1 - 1/n, n)
+           quantiles, one per second at its start. A second that would take two frames (BOLT
+           repeats the frame) gets them read off inside it, as kelly does, so all n differ.
+    aks    AKS's adaptive keyframe sampling (CVPR 2025; frame_select.py, released defaults):
+           min-max normalised scores, judge-and-split (aks_leaves), the top int(n / 2**depth)
+           seconds of each leaf. A video shorter than n seconds gets n uniform frames (AKS
+           returns every frame of it).
     """
     import numpy as np
     z = np.asarray(z, dtype=np.float64)[:max(1, int(np.ceil(dur)))]
     T = len(z)
     if alloc == "topk":
         return sorted(float(k) + 0.5 for k in np.argsort(-z)[:n])
+    if alloc == "aks":
+        if T < n:
+            return [dur * (i + 0.5) / n for i in range(n)]
+        s = (z - z.min()) / (z.max() - z.min())
+        picks = []
+        for lo, hi, d in aks_leaves(s, n, *aks):
+            picks += [lo + int(j) for j in np.argsort(-s[lo:hi], kind="stable")[:int(n / 2 ** d)]]
+        return sorted(float(k) for k in picks)
+    if alloc == "its":
+        s = z - z.min()
+        s = (s / s.max()) ** power if s.max() > 0 else np.ones(T)
+        p = s / s.sum()
+        cdf = np.cumsum(p)
+        grid = np.linspace(1 / n, 1 - 1 / n, n)
+        ks = np.searchsorted(cdf, grid)
+        out = []
+        for q, k in zip(grid, ks):
+            k = min(int(k), T - 1)
+            if np.count_nonzero(ks == k) == 1:
+                out.append(float(k))
+            else:
+                prev = cdf[k - 1] if k > 0 else 0.0
+                out.append(min(dur - 1e-3, k + (q - prev) / p[k]))
+        return out
     p = np.exp((z - z.max()) / tau)
     p = (1 - eps) * p / p.sum() + eps / T
     cdf = np.cumsum(p)
@@ -226,8 +280,13 @@ def main() -> None:
     ap.add_argument("--curves", default="",
                     help="curve arm: npz of per-second score curves keyed "
                          "'lvbench:<key>>>><uid>' (t1_train.py eval_lvbench writes them)")
-    ap.add_argument("--alloc", choices=["topk", "kelly"], default="kelly",
-                    help="curve arm: how a curve becomes frame times (see curve_times)")
+    ap.add_argument("--alloc", choices=["topk", "kelly", "its", "aks"], default="kelly",
+                    help="curve arm: how a curve becomes frame times (see curve_times); its = "
+                         "BOLT's inverse transform sampling, aks = AKS's judge-and-split")
+    ap.add_argument("--power", type=float, default=3.0, help="its: BOLT's exponent")
+    ap.add_argument("--aks_t1", type=float, default=0.8, help="aks: split threshold (released default)")
+    ap.add_argument("--aks_t2", type=float, default=-100.0, help="aks: std threshold (released default)")
+    ap.add_argument("--aks_depth", type=int, default=5, help="aks: maximum depth (released default)")
     ap.add_argument("--tau", type=float, default=1.0, help="kelly: posterior temperature")
     ap.add_argument("--eps", type=float, default=0.5, help="kelly: uniform share of the budget")
     ap.add_argument("--curve_placebo", action="store_true",
@@ -243,6 +302,13 @@ def main() -> None:
                     help="a seeded random subset of N questions (kept in video order, so the "
                          "per-video reference memo still applies); --limit takes the first N, "
                          "which covers only a handful of videos")
+    ap.add_argument("--shard", default="",
+                    help="K/N: answer only the videos whose order of first appearance is K mod N, "
+                         "so N processes can split one arm; a video's questions stay together "
+                         "and the per-question computation is unchanged")
+    ap.add_argument("--skip_done", nargs="*", default=[],
+                    help="other jsonl files whose questions count as done (a shard resuming "
+                         "past the rows its arm wrote before it was split)")
     args = ap.parse_args()
 
     if args.bench == "lvbench":
@@ -275,11 +341,12 @@ def main() -> None:
 
     # Resume: skip questions already written, so a killed run continues where it stopped.
     done: set[str] = set()
-    if os.path.exists(args.out):
-        with open(args.out, encoding="utf-8") as fh:
-            for line in fh:
-                if line.strip():
-                    done.add(json.loads(line)["key"])
+    for path in [args.out] + args.skip_done:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    if line.strip():
+                        done.add(json.loads(line)["key"])
     print(f"arm={args.arm} n_frames={args.n_frames} todo={len(items) - len(done)}", flush=True)
 
     processor = AutoProcessor.from_pretrained(args.model, padding_side="left",
@@ -342,6 +409,16 @@ def main() -> None:
         print(f"curves: {args.curves} alloc={args.alloc} tau={args.tau} eps={args.eps}"
               f"{' PLACEBO (same video, other question)' if args.curve_placebo else ''}",
               flush=True)
+
+    if args.shard:
+        # After the placebo pairing, which needs every question of a video, and by whole video,
+        # so the per-video reference read is still decoded once.
+        shard_k, shard_n = (int(x) for x in args.shard.split("/"))
+        vids = list(dict.fromkeys(it["key"] for it in items))
+        keep = {v for i, v in enumerate(vids) if i % shard_n == shard_k}
+        items = [it for it in items if it["key"] in keep]
+        print(f"shard {shard_k}/{shard_n}: {len(items)} questions from {len(keep)} videos, "
+              f"{sum(it['rkey'] not in done for it in items)} still to answer", flush=True)
 
     prior_model = prior_proc = None
     if args.center == "prior" or args.arm == "topk_siglip":
@@ -407,7 +484,8 @@ def main() -> None:
                     realized.append(abs(min(dur, center + args.offpeak_shift) - center))
                 if args.arm == "curve":
                     times = curve_times(curves[curve_of[key]], dur, n, args.alloc,
-                                        args.tau, args.eps)
+                                        args.tau, args.eps, power=args.power,
+                                        aks=(args.aks_t1, args.aks_t2, args.aks_depth))
                 idx = times_to_indices(times, native_fps, total, n)
                 if vr_memo.get("path") != item["video_path"]:   # one reader per video
                     vr_memo.update(path=item["video_path"], vr=VideoReader(item["video_path"]))
