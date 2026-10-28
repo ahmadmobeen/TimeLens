@@ -19,7 +19,7 @@ DRY=0; [ "${2:-}" = "--dry-run" ] && DRY=1
 Q3=Qwen/Qwen3-VL-8B-Instruct
 declare -A TOTAL=([videomme]=2700 [lvb]=1337 [mlvu]=2174 [cgbench]=3000 [lvbench]=1534)
 # the same-video placebo skips CG-Bench's 317 single-question videos (no partner question)
-declare -A ARM_TOTAL=([x1_cgbench_a3_kelly_placebo]=2683)
+declare -A ARM_TOTAL=([x1_cgbench_a3_kelly_placebo]=2683 [x1_cgbench_q8_kelly_placebo]=2683)
 ts() { date '+%F %T'; }
 sig() { echo "data/t1/priors/siglip_so400m/$1_curves_maxopt.npz"; }
 q8b() { echo "data/t1/priors/qwen3vl_emb_8b/$1_curves_maxopt.npz"; }
@@ -27,6 +27,14 @@ fused() { echo "data/t1/priors/fused_siglip_q8b/$1_curves_maxopt.npz"; }
 
 arms() {  # name|bench|venv|prerequisite curves|eval args
   local b
+  # confirmation runs for the simplified method M (8B with options, Kelly tau 3.58, eps 0.5)
+  echo "q8_kelly_q3|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5 --model $Q3"
+  echo "q8_kelly_q35|lvbench|.venv-q35|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5 --model Qwen/Qwen3.5-4B"
+  echo "q8_kelly_placebo|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5 --curve_placebo"
+  echo "x1_cgbench_q8_kelly_placebo|cgbench|.venv|$(q8b cgbench)|--arm curve --curves $(q8b cgbench) --alloc kelly --tau 3.58 --eps 0.5 --curve_placebo"
+  for b in videomme lvb mlvu cgbench; do
+    echo "x1_${b}_q8_kelly_q3|$b|.venv|$(q8b $b)|--arm curve --curves $(q8b $b) --alloc kelly --tau 3.58 --eps 0.5 --model $Q3"
+  done
   # X1 amendment 2: the 8B scorer with options under Kelly (its own CV temperature 3.58)
   echo "q8_kelly|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5"
   for b in videomme lvb mlvu cgbench; do
