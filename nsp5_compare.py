@@ -99,6 +99,8 @@ def main() -> None:
               f"{f'[{lo * 100:+.2f}, {hi * 100:+.2f}]':>18}"
               f"{f'{int((d > 0).sum())}/{int((d < 0).sum())}':>11}{ins_s}")
 
+    if not all(ref[k].get("span") for k in keys):
+        return                         # a bench.py set without evidence spans: headline only
     span = np.array([ref[k]["span"][1] - ref[k]["span"][0] for k in keys])
     bins = [("instant", span == 0), ("1-30 s", (span > 0) & (span <= 30)),
             ("31-300 s", (span > 30) & (span <= 300)), (">300 s", span > 300)]
