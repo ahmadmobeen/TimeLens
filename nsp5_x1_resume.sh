@@ -28,7 +28,7 @@ fused() { echo "data/t1/priors/fused_siglip_q8b/$1_curves_maxopt.npz"; }
 tau_of() { python3 -c "import json,sys; print(round(json.load(open(sys.argv[1]))['tau'], 2))" "$1" 2>/dev/null; }
 
 arms() {  # name|bench|venv|prerequisite curves|eval args
-  local b pre tag pw q8 cc cl bl tc tb
+  local b pre tag pw ak q8 cc cl bl tc tb
   # Prior art in our harness (METHODS-LOG 2026-10-28, pre-registered): F2C's query form, BOLT and
   # AKS as released, each published rule on M's scores, Kelly on each published scorer. Kelly
   # temperatures come from the LVBench likelihood fits; an arm whose fit is missing is not listed.
@@ -37,15 +37,16 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
   for b in lvbench videomme lvb mlvu cgbench; do
     pre=""; tag=""; [ $b != lvbench ] && { pre="x1_${b}_"; tag="${b}_"; }
     pw=3; [ $b = lvb ] && pw=2.5                              # BOLT's script: 2.5 on LongVideoBench
+    ak=""; [ $b = lvb ] && ak=" --aks_t1 0.2 --aks_depth 3"   # AKS's own LongVideoBench setting
     q8=data/t1/priors/qwen3vl_emb_8b/${tag}curves_maxopt.npz
     cc=data/t1/priors/qwen3vl_emb_8b/${tag}curves_concat.npz
     cl=data/t1/priors/clip_l14/${tag}curves_stem.npz
     bl=data/t1/priors/blip_itm_l/${tag}curves_stem.npz
     echo "${pre}f2c_kelly|$b|.venv|$cc|--arm curve --curves $cc --alloc kelly --tau 3.58 --eps 0.5"
     echo "${pre}bolt_its_q8|$b|.venv|$q8|--arm curve --curves $q8 --alloc its --power $pw"
-    echo "${pre}aks_ada_q8|$b|.venv|$q8|--arm curve --curves $q8 --alloc aks"
+    echo "${pre}aks_ada_q8|$b|.venv|$q8|--arm curve --curves $q8 --alloc aks$ak"
     echo "${pre}bolt_own|$b|.venv|$cl|--arm curve --curves $cl --alloc its --power $pw"
-    echo "${pre}aks_own|$b|.venv|$bl|--arm curve --curves $bl --alloc aks"
+    echo "${pre}aks_own|$b|.venv|$bl|--arm curve --curves $bl --alloc aks$ak"
     [ -n "$tc" ] && echo "${pre}kelly_clip|$b|.venv|$cl|--arm curve --curves $cl --alloc kelly --tau $tc --eps 0.5"
     [ -n "$tb" ] && echo "${pre}kelly_blip|$b|.venv|$bl|--arm curve --curves $bl --alloc kelly --tau $tb --eps 0.5"
   done
