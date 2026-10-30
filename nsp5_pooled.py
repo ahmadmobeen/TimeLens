@@ -32,13 +32,13 @@ def load(p):
     return {r["key"]: float(r["correct"]) for r in rows}
 
 
-def pooled(a, r, n=5000, seed=0, benches=BENCH):
+def pooled(a, r, n=5000, seed=0, benches=BENCH, keys=None):
     """a minus r: per-benchmark rows (bench, n, acc a, acc r, diff) and the pooled diff with its
-    95 % interval, all in points."""
+    95 % interval, all in points. keys, if given, keeps only those questions."""
     rows, strata = [], []
     for b in benches:
         A, R = load(path(a, b)), load(path(r, b))
-        ks = sorted(set(A) & set(R))
+        ks = sorted(set(A) & set(R) & (set(A) if keys is None else set(keys)))
         d = np.array([A[k] - R[k] for k in ks])
         _, inv = np.unique([video_of(k) for k in ks], return_inverse=True)
         strata.append((np.bincount(inv, weights=d), np.bincount(inv).astype(float)))

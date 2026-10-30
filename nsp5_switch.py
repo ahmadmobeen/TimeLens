@@ -25,6 +25,7 @@ from nsp5_pooled import BENCH, pooled
 
 L, P = "logs/nsp5", "data/t1/priors/qwen3vl_emb_8b"
 TAU = 3.58
+BUDGET = 64
 # the corrected references of the amendment (--refill nearest; top-k with --topk_short uniform)
 KELLY = {b: f"{L}/q8_kelly_nr.jsonl" if b == "lvbench" else f"{L}/x1_{b}_q8_kelly_nr.jsonl"
          for b in BENCH}
@@ -90,6 +91,16 @@ def main():
     print("Test, the four X1 benchmarks pooled (LVBench was the fit):")
     for r in ("q8_kelly_nr", "q8opt_topk_nr"):
         rows, diff, (lo, hi) = pooled("q8_switch", r, benches=BENCH[1:])
+        print(f"  switch minus {r}: {diff:+.2f} [{lo:+.2f}, {hi:+.2f}]  n={sum(x[1] for x in rows)}")
+    # Addendum before scoring: on a clip shorter than the budget top-k spreads its frames evenly
+    # (--topk_short uniform), so the rule's 'concentrate' branch only concentrates on longer clips.
+    long = {k for b in BENCH for k, r in data[b][0].items() if np.ceil(r["duration_s"]) >= BUDGET}
+    short = [h for b in BENCH[1:] for k, h in data[b][2].items() if k not in long]
+    print(f"Short clips (under {BUDGET} s): {len(short)} X1 questions, "
+          f"{100 * np.mean([v <= t for v in short]):.1f}% routed to top-k (even frames there)")
+    print(f"Secondary, X1 clips of {BUDGET} s or more:")
+    for r in ("q8_kelly_nr", "q8opt_topk_nr"):
+        rows, diff, (lo, hi) = pooled("q8_switch", r, benches=BENCH[1:], keys=long)
         print(f"  switch minus {r}: {diff:+.2f} [{lo:+.2f}, {hi:+.2f}]  n={sum(x[1] for x in rows)}")
 
 
