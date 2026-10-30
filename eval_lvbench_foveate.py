@@ -108,11 +108,37 @@ def aks_leaves(s, n: int, t1: float, t2: float, depth_max: int) -> list[tuple[in
     return leaves
 
 
+def times_to_indices_nearest(times: list[float], native_fps: float, total: int, n: int) -> list[int]:
+    """times_to_indices, except that a time whose source frame is already taken gets the nearest
+    unused frame (the later one on a tie), so a crowded second spills into its neighbours instead
+    of the start of the video. A budget still short after that (fewer times than n) is filled
+    from the start, as before."""
+    taken, idx = set(), []
+    for t in sorted(times):
+        w = min(total - 1, max(0, round(t * native_fps)))
+        for d in range(total):
+            c = next((x for x in (w + d, w - d) if 0 <= x < total and x not in taken), None)
+            if c is not None:
+                taken.add(c)
+                idx.append(c)
+                break
+    cursor = 0
+    while len(idx) < n and cursor < total:
+        if cursor not in taken:
+            taken.add(cursor)
+            idx.append(cursor)
+        cursor += 1
+    return sorted(idx)[:n]
+
+
 def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float, power: float = 3.0,
-                aks: tuple[float, float, int] = (0.8, -100.0, 5)) -> list[float]:
+                aks: tuple[float, float, int] = (0.8, -100.0, 5),
+                short_uniform: bool = False) -> list[float]:
     """Frame times from a per-second score curve (second k covers [k, k+1)).
 
-    topk   the n highest-scoring seconds.
+    topk   the n highest-scoring seconds. A video shorter than n seconds gets one frame per
+           second, and times_to_indices makes up the rest from the start of the video; with
+           short_uniform it gets n uniform frames instead, as aks does.
     kelly  inverse-CDF quantiles of (1 - eps) * softmax(z / tau) + eps * uniform: frames
            in proportion to posterior mass. When accuracy grows with log(frames on the
            evidence), as E3's ladder shows, proportional allocation maximises expected
@@ -131,6 +157,8 @@ def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float, power
     z = np.asarray(z, dtype=np.float64)[:max(1, int(np.ceil(dur)))]
     T = len(z)
     if alloc == "topk":
+        if short_uniform and T < n:
+            return [dur * (i + 0.5) / n for i in range(n)]
         return sorted(float(k) + 0.5 for k in np.argsort(-z)[:n])
     if alloc == "aks":
         if T < n:
@@ -287,6 +315,12 @@ def main() -> None:
     ap.add_argument("--aks_t1", type=float, default=0.8, help="aks: split threshold (released default)")
     ap.add_argument("--aks_t2", type=float, default=-100.0, help="aks: std threshold (released default)")
     ap.add_argument("--aks_depth", type=int, default=5, help="aks: maximum depth (released default)")
+    ap.add_argument("--refill", choices=["start", "nearest"], default="start",
+                    help="a placed time whose source frame is taken: restore the budget from the "
+                         "start of the video (times_to_indices) or take the nearest unused frame")
+    ap.add_argument("--topk_short", choices=["refill", "uniform"], default="refill",
+                    help="topk on a video shorter than the frame budget: one frame per second plus "
+                         "the refill, or the budget spread uniformly over the video")
     ap.add_argument("--tau", type=float, default=1.0, help="kelly: posterior temperature")
     ap.add_argument("--eps", type=float, default=0.5, help="kelly: uniform share of the budget")
     ap.add_argument("--curve_placebo", action="store_true",
@@ -485,10 +519,13 @@ def main() -> None:
                 if args.arm == "curve":
                     times = curve_times(curves[curve_of[key]], dur, n, args.alloc,
                                         args.tau, args.eps, power=args.power,
-                                        aks=(args.aks_t1, args.aks_t2, args.aks_depth))
-                idx = times_to_indices(times, native_fps, total, n)
+                                        aks=(args.aks_t1, args.aks_t2, args.aks_depth),
+                                        short_uniform=args.topk_short == "uniform")
+                idx = (times_to_indices_nearest if args.refill == "nearest" else times_to_indices)(
+                    times, native_fps, total, n)
                 # frames the budget refill supplied: times that fell on an already-taken source
-                # frame (times_to_indices refills from the start of the video)
+                # frame, plus any shortfall (from the start of the video, or with --refill nearest
+                # from the nearest unused frames)
                 n_refill = (n - len({min(total - 1, max(0, round(t * native_fps))) for t in times})
                             if args.arm == "curve" else None)
                 if vr_memo.get("path") != item["video_path"]:   # one reader per video

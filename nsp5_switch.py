@@ -25,8 +25,10 @@ from nsp5_pooled import BENCH, pooled
 
 L, P = "logs/nsp5", "data/t1/priors/qwen3vl_emb_8b"
 TAU = 3.58
-KELLY = {b: f"{L}/q8_kelly.jsonl" if b == "lvbench" else f"{L}/x1_{b}_q8_kelly.jsonl" for b in BENCH}
-TOPK = {b: f"{L}/ge1_opt_topk.jsonl" if b == "lvbench" else f"{L}/x1_{b}_q8opt_topk.jsonl"
+# the corrected references of the amendment (--refill nearest; top-k with --topk_short uniform)
+KELLY = {b: f"{L}/q8_kelly_nr.jsonl" if b == "lvbench" else f"{L}/x1_{b}_q8_kelly_nr.jsonl"
+         for b in BENCH}
+TOPK = {b: f"{L}/q8opt_topk_nr.jsonl" if b == "lvbench" else f"{L}/x1_{b}_q8opt_topk_nr.jsonl"
         for b in BENCH}
 
 
@@ -86,7 +88,7 @@ def main():
     for b in BENCH:
         print(f"{b:<9} routed to top-k: {write(b, *data[b], t):5.1f}%")
     print("Test, the four X1 benchmarks pooled (LVBench was the fit):")
-    for r in ("q8_kelly", "ge1_opt_topk:q8opt_topk"):
+    for r in ("q8_kelly_nr", "q8opt_topk_nr"):
         rows, diff, (lo, hi) = pooled("q8_switch", r, benches=BENCH[1:])
         print(f"  switch minus {r}: {diff:+.2f} [{lo:+.2f}, {hi:+.2f}]  n={sum(x[1] for x in rows)}")
 
