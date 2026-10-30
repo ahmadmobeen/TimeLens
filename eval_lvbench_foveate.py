@@ -487,6 +487,10 @@ def main() -> None:
                                         args.tau, args.eps, power=args.power,
                                         aks=(args.aks_t1, args.aks_t2, args.aks_depth))
                 idx = times_to_indices(times, native_fps, total, n)
+                # frames the budget refill supplied: times that fell on an already-taken source
+                # frame (times_to_indices refills from the start of the video)
+                n_refill = (n - len({min(total - 1, max(0, round(t * native_fps))) for t in times})
+                            if args.arm == "curve" else None)
                 if vr_memo.get("path") != item["video_path"]:   # one reader per video
                     vr_memo.update(path=item["video_path"], vr=VideoReader(item["video_path"]))
                 vr = vr_memo["vr"]
@@ -568,7 +572,7 @@ def main() -> None:
                 "key": key, "arm": args.arm, "pred_letter": pred, "gold_letter": item["gold"],
                 "correct": is_correct, "raw": reply.strip()[:80], "center_s": center,
                 "prior_abs_err_s": prior_err,
-                "span": item["span"], "duration_s": dur, "n_frames": len(idx),
+                "span": item["span"], "duration_s": dur, "n_frames": len(idx), "n_refill": n_refill,
                 "in_span": (sum(any(a - 0.5 <= i / native_fps <= b + 0.5 for a, b in item["spans"])
                                 for i in idx) if item["spans"] else None),
                 "p_letters": [round(p, 5) for p in p_letters]}) + "\n")

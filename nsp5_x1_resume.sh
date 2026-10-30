@@ -49,6 +49,11 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
     echo "${pre}aks_own|$b|.venv|$bl|--arm curve --curves $bl --alloc aks$ak"
     [ -n "$tc" ] && echo "${pre}kelly_clip|$b|.venv|$cl|--arm curve --curves $cl --alloc kelly --tau $tc --eps 0.5"
     [ -n "$tb" ] && echo "${pre}kelly_blip|$b|.venv|$bl|--arm curve --curves $bl --alloc kelly --tau $tb --eps 0.5"
+    # Calibration and the hedge separated (METHODS-LOG 2026-10-30, pre-registered): M's scores
+    # and placement with no uniform share, and at half and twice the fitted temperature.
+    echo "${pre}q8_kelly_eps0|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0"
+    echo "${pre}q8_kelly_tau179|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 1.79 --eps 0.5"
+    echo "${pre}q8_kelly_tau716|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 7.16 --eps 0.5"
   done
   # confirmation runs for the simplified method M (8B with options, Kelly tau 3.58, eps 0.5)
   echo "q8_kelly_q3|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5 --model $Q3"
