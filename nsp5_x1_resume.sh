@@ -66,6 +66,8 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
     echo "${pre}q8_kelly_eps0_tau179|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 1.79 --eps 0 --refill nearest"
     echo "${pre}q8_kelly_eps0_tau716|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 7.16 --eps 0 --refill nearest"
     echo "${pre}q8_kelly_q3_nr|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0.5 --refill nearest --model $Q3"
+    # F2C's appended query placed as M2 (METHODS-LOG 2026-11-02, pre-registered: P1')
+    echo "${pre}f2c_kelly_eps0|$b|.venv|$cc|--arm curve --curves $cc --alloc kelly --tau 3.58 --eps 0 --refill nearest"
   done
   local lv=data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz cg
   cg=$(q8b cgbench)
