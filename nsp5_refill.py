@@ -9,10 +9,14 @@ and rate as the harness does (decord: len(vr), vr.get_avg_fps()), re-places ever
 with curve_times, and keeps a logged row only where the old rule refilled nothing. The kept rows
 seed <arm>_nr.jsonl; the harness, resuming from that file with the new flags, answers the rest.
 
-    .venv/bin/python nsp5_refill.py
+    .venv/bin/python nsp5_refill.py                          # M and top-k (Qwen2.5-VL)
+    .venv/bin/python nsp5_refill.py q8_kelly_q3:kelly q8_kelly_q35:kelly   # other answer models
+
+An argument is stem:alloc[:LVBench file]; a benchmark where the arm was never run is skipped.
 """
 import json
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -23,7 +27,16 @@ from eval_lvbench_foveate import curve_times
 L, P = "logs/nsp5", "data/t1/priors/qwen3vl_emb_8b"
 BENCH = ("lvbench", "videomme", "lvb", "mlvu", "cgbench")
 META = f"{L}/video_meta.json"
-ARMS = {"q8_kelly": ("kelly", "q8_kelly"), "q8opt_topk": ("topk", "ge1_opt_topk")}  # alloc, LVBench file
+DEFAULT = ("q8_kelly:kelly", "q8opt_topk:topk:ge1_opt_topk")
+
+
+def arms(specs):
+    """{stem: (alloc, LVBench file stem)} from stem:alloc[:LVBench file] arguments."""
+    out = {}
+    for spec in specs or DEFAULT:
+        stem, alloc, *lvb = spec.split(":")
+        out[stem] = (alloc, lvb[0] if lvb else stem)
+    return out
 
 
 def video_meta(path):
@@ -51,9 +64,11 @@ def main():
         curves = np.load(f"{P}/{'' if b == 'lvbench' else b + '_'}curves_maxopt.npz")
         cut = len("lvbench:") if b == "lvbench" else 0
         path_of = {it.key[cut:]: (it.key, it.video_path) for it in items[b]}
-        for arm, (alloc, lvb_file) in ARMS.items():
+        for arm, (alloc, lvb_file) in arms(sys.argv[1:]).items():
             src = f"{L}/{lvb_file}.jsonl" if b == "lvbench" else f"{L}/x1_{b}_{arm}.jsonl"
             dst = f"{L}/{arm}_nr.jsonl" if b == "lvbench" else f"{L}/x1_{b}_{arm}_nr.jsonl"
+            if not os.path.exists(src):
+                continue
             if os.path.exists(dst):
                 raise SystemExit(f"{dst} exists; not overwriting a seed")
             kept, rerun, off = [], 0, 0

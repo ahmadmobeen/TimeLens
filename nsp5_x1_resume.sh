@@ -19,7 +19,8 @@ DRY=0; [ "${2:-}" = "--dry-run" ] && DRY=1
 Q3=Qwen/Qwen3-VL-8B-Instruct
 declare -A TOTAL=([videomme]=2700 [lvb]=1337 [mlvu]=2174 [cgbench]=3000 [lvbench]=1534)
 # the same-video placebo skips CG-Bench's 317 single-question videos (no partner question)
-declare -A ARM_TOTAL=([x1_cgbench_a3_kelly_placebo]=2683 [x1_cgbench_q8_kelly_placebo]=2683)
+declare -A ARM_TOTAL=([x1_cgbench_a3_kelly_placebo]=2683 [x1_cgbench_q8_kelly_placebo]=2683
+                      [x1_cgbench_q8_kelly_eps0_placebo]=2683)
 ts() { date '+%F %T'; }
 sig() { echo "data/t1/priors/siglip_so400m/$1_curves_maxopt.npz"; }
 q8b() { echo "data/t1/priors/qwen3vl_emb_8b/$1_curves_maxopt.npz"; }
@@ -58,7 +59,20 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
     echo "${pre}q8_kelly_tau716|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 7.16 --eps 0.5 --refill nearest"
     echo "${pre}q8_kelly_nr|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0.5 --refill nearest"
     echo "${pre}q8opt_topk_nr|$b|.venv|$q8|--arm curve --curves $q8 --alloc topk --refill nearest --topk_short uniform"
+    # M2 = M without the hedge (METHODS-LOG 2026-11-02, pre-registered): its confirmation with
+    # Qwen3-VL-8B, the temperature check without the hedge, and M with Qwen3-VL under the nearest
+    # refill (seeded by nsp5_refill.py; only crowded questions rerun).
+    echo "${pre}q8_kelly_eps0_q3|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0 --refill nearest --model $Q3"
+    echo "${pre}q8_kelly_eps0_tau179|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 1.79 --eps 0 --refill nearest"
+    echo "${pre}q8_kelly_eps0_tau716|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 7.16 --eps 0 --refill nearest"
+    echo "${pre}q8_kelly_q3_nr|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0.5 --refill nearest --model $Q3"
   done
+  local lv=data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz cg
+  cg=$(q8b cgbench)
+  echo "q8_kelly_eps0_q35|lvbench|.venv-q35|$lv|--arm curve --curves $lv --alloc kelly --tau 3.58 --eps 0 --refill nearest --model Qwen/Qwen3.5-4B"
+  echo "q8_kelly_q35_nr|lvbench|.venv-q35|$lv|--arm curve --curves $lv --alloc kelly --tau 3.58 --eps 0.5 --refill nearest --model Qwen/Qwen3.5-4B"
+  echo "q8_kelly_eps0_placebo|lvbench|.venv|$lv|--arm curve --curves $lv --alloc kelly --tau 3.58 --eps 0 --refill nearest --curve_placebo"
+  echo "x1_cgbench_q8_kelly_eps0_placebo|cgbench|.venv|$cg|--arm curve --curves $cg --alloc kelly --tau 3.58 --eps 0 --refill nearest --curve_placebo"
   # confirmation runs for the simplified method M (8B with options, Kelly tau 3.58, eps 0.5)
   echo "q8_kelly_q3|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5 --model $Q3"
   echo "q8_kelly_q35|lvbench|.venv-q35|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5 --model Qwen/Qwen3.5-4B"

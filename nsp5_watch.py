@@ -19,12 +19,14 @@ L = "logs/nsp5"
 TOT = {"videomme": 2700, "lvb": 1337, "mlvu": 2174, "cgbench": 3000}
 ARMS = {"g2_q35_b1": 1534, "x1_cgbench_a3_kelly_placebo": 2683,  # placebo: multi-question videos only
         "q8_kelly": 1534, "q8_kelly_q3": 1534, "q8_kelly_q35": 1534, "q8_kelly_placebo": 1534,
-        "x1_cgbench_q8_kelly_placebo": 2683}
+        "x1_cgbench_q8_kelly_placebo": 2683, "q8_kelly_eps0_q35": 1534, "q8_kelly_q35_nr": 1534,
+        "q8_kelly_eps0_placebo": 1534, "x1_cgbench_q8_kelly_eps0_placebo": 2683}
 for _b, _t in TOT.items():
     for _a in ("uniform", "b1", "a2_kelly", "a3_kelly", "a3_kelly_q3", "q8opt_topk", "uniform_q3", "q8_kelly", "q8_kelly_q3"):
         ARMS[f"x1_{_b}_{_a}"] = _t
 for _a in ("f2c_kelly", "bolt_its_q8", "aks_ada_q8", "bolt_own", "aks_own", "kelly_clip", "kelly_blip",
-           "q8_kelly_eps0", "q8_kelly_tau179", "q8_kelly_tau716", "q8_kelly_nr", "q8opt_topk_nr"):
+           "q8_kelly_eps0", "q8_kelly_tau179", "q8_kelly_tau716", "q8_kelly_nr", "q8opt_topk_nr",
+           "q8_kelly_eps0_q3", "q8_kelly_eps0_tau179", "q8_kelly_eps0_tau716", "q8_kelly_q3_nr"):
     ARMS[_a] = 1534                      # prior-art arms (2026-10-28), calibration/hedge (2026-10-30)
     for _b, _t in TOT.items():
         ARMS[f"x1_{_b}_{_a}"] = _t
