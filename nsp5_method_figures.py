@@ -1,23 +1,24 @@
 """NS-P5: the numbers behind METHOD.md and the deck's method slides, from logged data only.
 
-Method M scores every second of a video with Qwen3-VL-Embedding-8B under each answer option,
+Method M2 scores every second of a video with Qwen3-VL-Embedding-8B under each answer option,
 keeps the best option per second, turns that curve into a probability at temperature 3.58,
-and places 64 frames at the quantiles of that probability mixed 50/50 with uniform (Kelly).
+and places 64 frames at the quantiles of that probability (Kelly placement). M, the method
+until 2026-11-02, first mixed the probability 50/50 with uniform; it is kept for comparison.
 This script recomputes, for LVBench:
 
   tau       the temperature fit (nll_cv) with its whole NLL-vs-tau curve and fold choices
   loc       localization of the stem and max-option curves (top second within 60 s, miss)
   example   one question end to end: per-option curves, probability, placements, answers
-  coverage  frames placed on the evidence by uniform, top-k and Kelly, and accuracy
+  coverage  frames placed on the evidence by uniform, top-k, M and M2, and accuracy
   e3        the oracle ladder's accuracy against its frames on the evidence
-  qtype     uniform, top-k and M by LVBench question type
+  qtype     uniform, top-k, M and M2 by LVBench question type
   options   which option's curve carries the top second (needs --peropt first)
-  spacing   how close two Kelly frames come (duplicate native frames are re-filled)
+  spacing   how close two M2 frames come, and the longest stretch without a frame (M and M2)
 
   env -u VIRTUAL_ENV PYTHONPATH=. .venv/bin/python -u nsp5_method_figures.py --peropt   # GPU, once
   env -u VIRTUAL_ENV PYTHONPATH=. .venv/bin/python -u nsp5_method_figures.py            # CPU
 
-Writes logs/nsp5/method_figures.json. Nothing here is fit or tuned: tau and eps are M's frozen
+Writes logs/nsp5/method_figures.json. Nothing here is fit or tuned: tau and eps are M2's frozen
 constants, and every accuracy comes from the logged runs.
 """
 from __future__ import annotations
@@ -36,7 +37,8 @@ from t1_data import lvbench_items, span_seconds
 PRIOR = "data/t1/priors/qwen3vl_emb_8b"
 LOGS = "logs/nsp5"
 OUT = os.path.join(LOGS, "method_figures.json")
-TAU, EPS, N = 3.58, 0.5, 64
+TAU, EPS, N = 3.58, 0.0, 64
+EPS_M = 0.5                                  # M's uniform share (the hedge), for comparison
 EXAMPLE = "k2FIFQIYBvA>>>4731"
 TAUS = np.exp(np.linspace(np.log(0.3), np.log(30), 40))
 E3_OFFPEAK_SHIFT = 600.0                     # eval_lvbench_foveate's --offpeak_shift default
@@ -157,10 +159,11 @@ def main() -> None:
     print("tau:", {q: (v["tau"], v["fold_tau"], v["heldout_nll"]) for q, v in res["tau"].items()},
           flush=True)
 
-    arms = ["e3_uniform", "b1_topk_siglip", "ge1_stem_topk", "ge1_opt_topk", "q8_kelly",
-            "e3_gauss_s240", "e3_gauss_s60", "e3_gauss_s15", "e3_offpeak_s60"]
+    # top-k and M with the nearest-frame refill (METHODS-LOG amendment of 2026-10-30), as M2
+    arms = ["e3_uniform", "b1_topk_siglip", "ge1_stem_topk", "q8opt_topk_nr", "q8_kelly_nr",
+            "q8_kelly_eps0", "e3_gauss_s240", "e3_gauss_s60", "e3_gauss_s15", "e3_offpeak_s60"]
     R = {a: rows(a) for a in arms}
-    dur = {k: R["q8_kelly"][k]["duration_s"] for k in keys}      # the harness's own duration
+    dur = {k: R["q8_kelly_eps0"][k]["duration_s"] for k in keys}  # the harness's own duration
 
     # frames on the evidence: uniform and the E3 kernels are deterministic, so recompute them
     def placed(arm: str, k: str) -> list[float]:
@@ -173,7 +176,7 @@ def main() -> None:
         raise KeyError(arm)
 
     cov = {}
-    for a in ["e3_uniform", "ge1_stem_topk", "ge1_opt_topk", "q8_kelly"]:
+    for a in ["e3_uniform", "ge1_stem_topk", "q8opt_topk_nr", "q8_kelly_nr", "q8_kelly_eps0"]:
         ins = np.array([in_span(placed(a, k), items[k]["span"]) if a == "e3_uniform"
                         else R[a][k]["in_span"] for k in keys])
         cor = np.array([R[a][k]["correct"] for k in keys], float)
@@ -188,17 +191,18 @@ def main() -> None:
     cov["by_evidence_length"] = {
         lab: {"n": int(m.sum()), **{a: round(float(np.mean([R[a][k]["correct"] for k, mm
                                                              in zip(keys, m) if mm])) * 100, 2)
-                                    for a in ["e3_uniform", "ge1_opt_topk", "q8_kelly"]}}
+                                    for a in ["e3_uniform", "q8opt_topk_nr", "q8_kelly_nr",
+                                              "q8_kelly_eps0"]}}
         for lab, m in bins.items()}
-    zt = [k for k in keys if R["ge1_opt_topk"][k]["in_span"] == 0]
-    zk = [k for k in keys if R["q8_kelly"][k]["in_span"] == 0]
-    only_k = [k for k in zt if R["q8_kelly"][k]["in_span"] > 0]
-    only_t = [k for k in zk if R["ge1_opt_topk"][k]["in_span"] > 0]
+    zt = [k for k in keys if R["q8opt_topk_nr"][k]["in_span"] == 0]
+    zk = [k for k in keys if R["q8_kelly_eps0"][k]["in_span"] == 0]
+    only_k = [k for k in zt if R["q8_kelly_eps0"][k]["in_span"] > 0]
+    only_t = [k for k in zk if R["q8opt_topk_nr"][k]["in_span"] > 0]
     acc = lambda a, ks: round(float(np.mean([R[a][k]["correct"] for k in ks])) * 100, 2)
-    cov["hedge"] = {"topk_zero_kelly_some": {"n": len(only_k), "kelly": acc("q8_kelly", only_k),
-                                             "topk": acc("ge1_opt_topk", only_k)},
-                    "kelly_zero_topk_some": {"n": len(only_t), "kelly": acc("q8_kelly", only_t),
-                                             "topk": acc("ge1_opt_topk", only_t)}}
+    cov["reach"] = {"topk_zero_m2_some": {"n": len(only_k), "M2": acc("q8_kelly_eps0", only_k),
+                                          "topk": acc("q8opt_topk_nr", only_k)},
+                    "m2_zero_topk_some": {"n": len(only_t), "M2": acc("q8_kelly_eps0", only_t),
+                                          "topk": acc("q8opt_topk_nr", only_t)}}
     res["coverage"] = cov
 
     res["e3"] = {}
@@ -215,16 +219,25 @@ def main() -> None:
     for t in sorted({t for k in keys for t in types[k]}):
         ks = [k for k in keys if t in types[k]]
         res["qtype"][t] = {"n": len(ks), "uniform": acc("e3_uniform", ks),
-                           "topk_8b_options": acc("ge1_opt_topk", ks), "M": acc("q8_kelly", ks)}
+                           "topk_8b_options": acc("q8opt_topk_nr", ks), "M": acc("q8_kelly_nr", ks),
+                           "M2": acc("q8_kelly_eps0", ks)}
 
-    gaps = []
+    gaps, longest = [], {"M": [], "M2": []}
     for k in keys:
-        ts = np.sort(curve_times(zo[k], dur[k], N, "kelly", TAU, EPS))
-        gaps.append(float(np.diff(ts).min()))
+        for lab, eps in (("M", EPS_M), ("M2", EPS)):
+            ts = np.sort(curve_times(zo[k], dur[k], N, "kelly", TAU, eps))
+            if lab == "M2":
+                gaps.append(float(np.diff(ts).min()))
+            # the longest stretch without a frame, counting the two ends of the video
+            longest[lab].append(float(max(np.diff(ts).max(), ts[0], dur[k] - ts[-1])))
     gaps = np.array(gaps)
     res["spacing"] = {"min_gap_median_s": round(float(np.median(gaps)), 3),
                       "share_min_gap_below_1_30s": round(float(np.mean(gaps < 1 / 30)), 4),
-                      "share_min_gap_below_1s": round(float(np.mean(gaps < 1.0)), 4)}
+                      "share_min_gap_below_1s": round(float(np.mean(gaps < 1.0)), 4),
+                      "longest_gap_median_s": {lab: round(float(np.median(v)), 1)
+                                               for lab, v in longest.items()},
+                      "share_longest_gap_over_quarter_video": round(float(np.mean(
+                          np.array(longest["M2"]) > 0.25 * np.array([dur[k] for k in keys]))), 4)}
 
     po_path = os.path.join(PRIOR, "curves_peropt.npz")
     if os.path.exists(po_path):
@@ -250,22 +263,23 @@ def main() -> None:
     it = items[k]
     z = zo[k][:max(1, int(np.ceil(dur[k])))]
     p = {str(t): (lambda q: (q / q.sum()))(np.exp((z - z.max()) / t)) for t in (1.0, TAU, 10.0)}
-    mix = (1 - EPS) * p[str(TAU)] + EPS / len(z)
     kel = curve_times(zo[k], dur[k], N, "kelly", TAU, EPS)
+    hedged = curve_times(zo[k], dur[k], N, "kelly", TAU, EPS_M)
     top = curve_times(zo[k], dur[k], N, "topk", TAU, EPS)
     uni = kernel_times("uniform", it["center"], dur[k], N)
     ex = {"key": k, "question": it["question"], "gold": it["gold"], "span": it["span"],
           "duration_s": dur[k], "T": len(z), "stem_curve": np.round(zs[k][:len(z)], 3).tolist(),
           "maxopt_curve": np.round(z, 3).tolist(),
           "p": {t: np.round(v, 6).tolist() for t, v in p.items()},
-          "mixture": np.round(mix, 6).tolist(), "kelly_times": [round(t, 3) for t in kel],
+          "kelly_times": [round(t, 3) for t in kel], "m_times": [round(t, 3) for t in hedged],
           "topk_times": top, "uniform_times": [round(t, 3) for t in uni],
           "frames_on_evidence": {"uniform": in_span(uni, it["span"]), "topk": in_span(top, it["span"]),
-                                 "kelly": in_span(kel, it["span"])},
+                                 "M": in_span(hedged, it["span"]), "M2": in_span(kel, it["span"])},
           "mass_on_evidence": {t: round(float(v[masks[k][:len(z)]].sum()), 4) for t, v in p.items()},
           "peaks": peaks(p[str(TAU)]),
-          "answers": {a: R[a][k]["pred_letter"] for a in ["e3_uniform", "b1_topk_siglip",
-                                                          "ge1_stem_topk", "ge1_opt_topk", "q8_kelly"]}}
+          "answers": {a: R[a][k]["pred_letter"] for a in ["e3_uniform", "b1_topk_siglip", "ge1_stem_topk",
+                                                          "q8opt_topk_nr", "q8_kelly_nr",
+                                                          "q8_kelly_eps0"]}}
     if os.path.exists(po_path):
         ex["option_curves"] = np.round(np.load(po_path)[f"lvbench:{k}"].astype(np.float64)[:, :len(z)],
                                        3).tolist()
