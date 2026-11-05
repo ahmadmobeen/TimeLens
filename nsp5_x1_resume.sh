@@ -81,6 +81,9 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
     [ -n "$tc" ] && echo "${pre}kelly_clip_nr|$b|.venv|$cl|--arm curve --curves $cl --alloc kelly --tau $tc --eps 0.5 --refill nearest"
     [ -n "$tb" ] && echo "${pre}kelly_blip_eps0|$b|.venv|$bl|--arm curve --curves $bl --alloc kelly --tau $tb --eps 0 --refill nearest"
     [ -n "$tb" ] && echo "${pre}kelly_blip_nr|$b|.venv|$bl|--arm curve --curves $bl --alloc kelly --tau $tb --eps 0.5 --refill nearest"
+    # Study F (METHODS-LOG 2026-11-05, pre-registered): GMM-EVA's selection (its top-K) with the
+    # options in the query, i.e. top-k on the 8B appended-query curve
+    echo "${pre}f2c_topk_nr|$b|.venv|$cc|--arm curve --curves $cc --alloc topk --refill nearest --topk_short uniform"
   done
   # Study C (METHODS-LOG 2026-11-05, pre-registered; run by nsp5_runner.py): the published
   # setting, 32 frames at lmms-eval's Qwen2.5-VL defaults (qwen_vl_utils caps its request at 768
@@ -95,6 +98,19 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
     echo "${pre}pub32_ge1_stem_topk|$b|.venv|$qs|--arm curve --curves $qs --alloc topk --refill nearest --topk_short uniform $pub"
     echo "${pre}pub32_bolt_own|$b|.venv|$cl|--arm curve --curves $cl --alloc its --power 3 --refill nearest $pub"
     echo "${pre}pub32_q8_kelly_eps0|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0 --refill nearest $pub"
+    cc=data/t1/priors/qwen3vl_emb_8b/${tag}curves_concat.npz
+    echo "${pre}pub32_f2c_topk|$b|.venv|$cc|--arm curve --curves $cc --alloc topk --refill nearest --topk_short uniform $pub"
+  done
+  # Study F at GMM-EVA's token budget: 32 frames of 200,704 pixels (256 tokens per frame pair,
+  # about 4,032 visual tokens, half of its 32 x 256 reference), on GMM-EVA's three benchmarks
+  local gb="--n_frames 32 --min_pixels 200704 --max_pixels 200704 --total_pixels 0"
+  for b in lvbench lvb videomme; do
+    pre=""; tag=""; [ $b != lvbench ] && { pre="x1_${b}_"; tag="${b}_"; }
+    q8=data/t1/priors/qwen3vl_emb_8b/${tag}curves_maxopt.npz
+    cc=data/t1/priors/qwen3vl_emb_8b/${tag}curves_concat.npz
+    echo "${pre}gb32_uniform|$b|.venv||--arm uniform $gb"
+    echo "${pre}gb32_f2c_topk|$b|.venv|$cc|--arm curve --curves $cc --alloc topk --refill nearest --topk_short uniform $gb"
+    echo "${pre}gb32_q8_kelly_eps0|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0 --refill nearest $gb"
   done
   local lv=data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz cg
   cg=$(q8b cgbench)

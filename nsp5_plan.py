@@ -2,9 +2,11 @@
 """Add registered arms to nsp5_runner.py's plan. Every arm printed by `bash nsp5_x1_resume.sh arms`
 whose name matches the pattern joins logs/nsp5/runner/plan.json under the given study label,
 after the arms already there (the runner launches in plan order). Run it only once the study's
-registration is on GitHub. Shards per arm follow the benchmark's size.
+registration is on GitHub. Shards per arm follow the benchmark's size. With --front the new arms
+go before every arm already planned, so their shards launch next.
 
     python3 nsp5_plan.py C 'pub32_'
+    python3 nsp5_plan.py F 'gb32_' --front
 """
 import json
 import os
@@ -33,7 +35,7 @@ def main() -> None:
             sys.exit(f"{name}: missing {prereq}; nothing added")
         added.append({"name": name, "study": study, "bench": bench, "venv": venv,
                       "args": args, "shards": SHARDS[bench], "total": int(total)})
-    plan["arms"] += added
+    plan["arms"] = added + plan["arms"] if "--front" in sys.argv[3:] else plan["arms"] + added
     os.makedirs(os.path.dirname(PLAN), exist_ok=True)
     with open(PLAN + ".tmp", "w") as fh:
         json.dump(plan, fh, indent=1)
