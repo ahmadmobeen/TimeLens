@@ -14,8 +14,10 @@ GPU rule. A GPU takes up to MAX_MINE of my evals while nobody else uses it, each
 FREE_MIN MiB free after RESERVE MiB is set aside for every launch of the last ten minutes. A GPU
 whose used memory my evals cannot explain is someone else's too: there I keep at most
 SHARED_MINE evals and leave SHARED_FREE MiB free (the owner's 70 GB rule of 2026-11-02).
-GPUs listed in logs/nsp5/runner/skip_gpus (e.g. "1,3") get no new launches. At most MAX_TOTAL
-evals run at once: each decodes video on about 10 CPU cores, and the container's quota is 128.
+GPUs listed in logs/nsp5/runner/skip_gpus (e.g. "1,3") get no new launches. A free slot goes to
+the GPU with the fewest of my evals. Launches pause while the container uses more than CPU_LIMIT
+of its 128 cores (measured over the last minute from the cgroup); an eval decodes video on about
+3 cores (2026-11-05), so GPU memory is usually the limit.
 
 A shard killed by a signal goes back to pending. Once no shard of an arm runs or waits, the arm
 is merged: every line parses, keys are unique across files (a duplicate must agree on the
@@ -36,9 +38,21 @@ TL = os.path.dirname(os.path.abspath(__file__))
 L = "logs/nsp5"
 R = f"{L}/runner"
 PLAN, STATUS, SKIP = f"{R}/plan.json", f"{R}/status.json", f"{R}/skip_gpus"
-MAX_MINE, SHARED_MINE, MAX_TOTAL = 6, 2, 16
+MAX_MINE, SHARED_MINE = 6, 2
 FREE_MIN, SHARED_FREE, RESERVE, PER_EVAL = 40000, 60000, 30000, 30000   # MiB
+CPU_STAT, CPU_LIMIT = "/sys/fs/cgroup/cpu.stat", 110                    # cores of the 128 quota
 RETRIES, LOOP_S = 2, 60
+
+
+def cpu_usec():
+    """The container's cumulative CPU time in microseconds, or None if unreadable."""
+    try:
+        for line in open(CPU_STAT):
+            if line.startswith("usage_usec"):
+                return int(line.split()[1])
+    except OSError:
+        pass
+    return None
 
 
 def log(msg: str) -> None:
@@ -143,6 +157,7 @@ def main() -> None:
     attempts = {}     # arm name -> relaunch rounds
     done, anomalies = set(), []
     recent = {}       # GPU -> launch times
+    last_cpu = (cpu_usec(), time.time())
     log(f"runner started, pid {os.getpid()}")
     while True:
         try:
@@ -205,6 +220,11 @@ def main() -> None:
                                 "running": run, "pending": pend})
 
         now = time.time()
+        u = cpu_usec()
+        cores = 0.0
+        if u is not None and last_cpu[0] is not None and now > last_cpu[1]:
+            cores = (u - last_cpu[0]) / ((now - last_cpu[1]) * 1e6)
+        last_cpu = (u, now)
         per_gpu = {}
         for _, g in running.values():
             per_gpu[g] = per_gpu.get(g, 0) + 1
@@ -222,17 +242,20 @@ def main() -> None:
                 ok = mine < MAX_MINE and room >= FREE_MIN
             gpu_status.append({"gpu": i, "used": used, "free": free, "mine": mine,
                                "shared": shared, "skip": i in skip, "takes": ok})
-            if ok and wanted and len(running) + len(children) - len(set(children) & set(running)) < MAX_TOTAL:
-                arm, k = wanted.pop(0)
-                out = files(arm)[k]
-                children[out] = launch(arm, k, i)
-                state[out] = "running"
-                recent[i].append(now)
-                log(f"launch {arm['name']} shard {k}/{arm['shards']} on GPU {i} "
-                    f"(pid {children[out].pid})")
+        # one launch per eligible GPU per minute, the least loaded GPU first, while CPU allows
+        for g in sorted((s for s in gpu_status if s["takes"]), key=lambda s: (s["mine"], -s["free"])):
+            if not wanted or cores > CPU_LIMIT:
+                break
+            arm, k = wanted.pop(0)
+            out = files(arm)[k]
+            children[out] = launch(arm, k, g["gpu"])
+            state[out] = "running"
+            recent[g["gpu"]].append(now)
+            log(f"launch {arm['name']} shard {k}/{arm['shards']} on GPU {g['gpu']} "
+                f"(pid {children[out].pid})")
         status = {"time": time.strftime("%F %T"), "pid": os.getpid(), "gpus": gpu_status,
-                  "running": len(running), "pending": len(wanted), "anomalies": anomalies,
-                  "arms": arms_status}
+                  "cpu_cores": round(cores, 1), "running": len(running), "pending": len(wanted),
+                  "anomalies": anomalies, "arms": arms_status}
         with open(STATUS + ".tmp", "w") as fh:
             json.dump(status, fh, indent=1)
         os.replace(STATUS + ".tmp", STATUS)
