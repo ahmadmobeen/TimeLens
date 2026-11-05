@@ -58,8 +58,11 @@ def pooled(a, r, n=5000, seed=0, benches=BENCH, keys=None):
 
 
 def main():
-    args = [x for x in sys.argv[1:] if x != "--x1"]
+    args = [x for x in sys.argv[1:] if not x.startswith("--")]
     benches = BENCH[1:] if "--x1" in sys.argv else BENCH
+    for x in sys.argv[1:]:
+        if x.startswith("--benches="):   # e.g. --benches=lvbench,videomme (Study C)
+            benches = tuple(x.split("=", 1)[1].split(","))
     full = sum(SIZE[b] for b in benches)
     a, others = args[0], args[1:]
     for r in others:

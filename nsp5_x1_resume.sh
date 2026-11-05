@@ -20,7 +20,8 @@ Q3=Qwen/Qwen3-VL-8B-Instruct
 declare -A TOTAL=([videomme]=2700 [lvb]=1337 [mlvu]=2174 [cgbench]=3000 [lvbench]=1534)
 # the same-video placebo skips CG-Bench's 317 single-question videos (no partner question)
 declare -A ARM_TOTAL=([x1_cgbench_a3_kelly_placebo]=2683 [x1_cgbench_q8_kelly_placebo]=2683
-                      [x1_cgbench_q8_kelly_eps0_placebo]=2683)
+                      [x1_cgbench_q8_kelly_eps0_placebo]=2683 [x1_cgbench_q8_kelly_eps010_placebo]=2683
+                      [x1_cgbench_q8_kelly_eps025_placebo]=2683 [x1_cgbench_q8_kelly_placebo_nr]=2683)
 ts() { date '+%F %T'; }
 sig() { echo "data/t1/priors/siglip_so400m/$1_curves_maxopt.npz"; }
 q8b() { echo "data/t1/priors/qwen3vl_emb_8b/$1_curves_maxopt.npz"; }
@@ -29,7 +30,7 @@ fused() { echo "data/t1/priors/fused_siglip_q8b/$1_curves_maxopt.npz"; }
 tau_of() { python3 -c "import json,sys; print(round(json.load(open(sys.argv[1]))['tau'], 2))" "$1" 2>/dev/null; }
 
 arms() {  # name|bench|venv|prerequisite curves|eval args
-  local b pre tag pw ak q8 cc cl bl tc tb
+  local b pre tag pw ak q8 cc cl bl tc tb sc qs
   # Prior art in our harness (METHODS-LOG 2026-10-28, pre-registered): F2C's query form, BOLT and
   # AKS as released, each published rule on M's scores, Kelly on each published scorer. Kelly
   # temperatures come from the LVBench likelihood fits; an arm whose fit is missing is not listed.
@@ -68,6 +69,32 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
     echo "${pre}q8_kelly_q3_nr|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0.5 --refill nearest --model $Q3"
     # F2C's appended query placed as M2 (METHODS-LOG 2026-11-02, pre-registered: P1')
     echo "${pre}f2c_kelly_eps0|$b|.venv|$cc|--arm curve --curves $cc --alloc kelly --tau 3.58 --eps 0 --refill nearest"
+    # Studies D and E (METHODS-LOG 2026-11-05, pre-registered; run by nsp5_runner.py). D: M2's
+    # placement with a small hedge. E: each weaker scorer placed as M2 (eps 0) and as M (eps 0.5),
+    # both with the nearest refill; SigLIP's LVBench curve predates the priors layout (A2).
+    echo "${pre}q8_kelly_eps010|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0.1 --refill nearest"
+    echo "${pre}q8_kelly_eps025|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0.25 --refill nearest"
+    sc=$(sig "$b"); [ "$b" = lvbench ] && sc=data/t1/curves/zeroshot_siglip_maxopt.npz
+    echo "${pre}a2_kelly_eps0|$b|.venv|$sc|--arm curve --curves $sc --alloc kelly --tau 1.59 --eps 0 --refill nearest"
+    echo "${pre}a2_kelly_nr|$b|.venv|$sc|--arm curve --curves $sc --alloc kelly --tau 1.59 --eps 0.5 --refill nearest"
+    [ -n "$tc" ] && echo "${pre}kelly_clip_eps0|$b|.venv|$cl|--arm curve --curves $cl --alloc kelly --tau $tc --eps 0 --refill nearest"
+    [ -n "$tc" ] && echo "${pre}kelly_clip_nr|$b|.venv|$cl|--arm curve --curves $cl --alloc kelly --tau $tc --eps 0.5 --refill nearest"
+    [ -n "$tb" ] && echo "${pre}kelly_blip_eps0|$b|.venv|$bl|--arm curve --curves $bl --alloc kelly --tau $tb --eps 0 --refill nearest"
+    [ -n "$tb" ] && echo "${pre}kelly_blip_nr|$b|.venv|$bl|--arm curve --curves $bl --alloc kelly --tau $tb --eps 0.5 --refill nearest"
+  done
+  # Study C (METHODS-LOG 2026-11-05, pre-registered; run by nsp5_runner.py): the published
+  # setting, 32 frames at lmms-eval's Qwen2.5-VL defaults (qwen_vl_utils caps its request at 768
+  # tokens per frame), on LVBench and Video-MME.
+  local pub="--n_frames 32 --min_pixels 200704 --max_pixels 1605632 --total_pixels 0"
+  for b in lvbench videomme; do
+    pre=""; tag=""; [ $b != lvbench ] && { pre="x1_${b}_"; tag="${b}_"; }
+    q8=data/t1/priors/qwen3vl_emb_8b/${tag}curves_maxopt.npz
+    qs=data/t1/priors/qwen3vl_emb_8b/${tag}curves_stem.npz
+    cl=data/t1/priors/clip_l14/${tag}curves_stem.npz
+    echo "${pre}pub32_uniform|$b|.venv||--arm uniform $pub"
+    echo "${pre}pub32_ge1_stem_topk|$b|.venv|$qs|--arm curve --curves $qs --alloc topk --refill nearest --topk_short uniform $pub"
+    echo "${pre}pub32_bolt_own|$b|.venv|$cl|--arm curve --curves $cl --alloc its --power 3 --refill nearest $pub"
+    echo "${pre}pub32_q8_kelly_eps0|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0 --refill nearest $pub"
   done
   local lv=data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz cg
   cg=$(q8b cgbench)
@@ -75,6 +102,13 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
   echo "q8_kelly_q35_nr|lvbench|.venv-q35|$lv|--arm curve --curves $lv --alloc kelly --tau 3.58 --eps 0.5 --refill nearest --model Qwen/Qwen3.5-4B"
   echo "q8_kelly_eps0_placebo|lvbench|.venv|$lv|--arm curve --curves $lv --alloc kelly --tau 3.58 --eps 0 --refill nearest --curve_placebo"
   echo "x1_cgbench_q8_kelly_eps0_placebo|cgbench|.venv|$cg|--arm curve --curves $cg --alloc kelly --tau 3.58 --eps 0 --refill nearest --curve_placebo"
+  # Study D's placebos: each hedge size on the same-video placebo; M's rerun with the nearest refill
+  echo "q8_kelly_eps010_placebo|lvbench|.venv|$lv|--arm curve --curves $lv --alloc kelly --tau 3.58 --eps 0.1 --refill nearest --curve_placebo"
+  echo "q8_kelly_eps025_placebo|lvbench|.venv|$lv|--arm curve --curves $lv --alloc kelly --tau 3.58 --eps 0.25 --refill nearest --curve_placebo"
+  echo "q8_kelly_placebo_nr|lvbench|.venv|$lv|--arm curve --curves $lv --alloc kelly --tau 3.58 --eps 0.5 --refill nearest --curve_placebo"
+  echo "x1_cgbench_q8_kelly_eps010_placebo|cgbench|.venv|$cg|--arm curve --curves $cg --alloc kelly --tau 3.58 --eps 0.1 --refill nearest --curve_placebo"
+  echo "x1_cgbench_q8_kelly_eps025_placebo|cgbench|.venv|$cg|--arm curve --curves $cg --alloc kelly --tau 3.58 --eps 0.25 --refill nearest --curve_placebo"
+  echo "x1_cgbench_q8_kelly_placebo_nr|cgbench|.venv|$cg|--arm curve --curves $cg --alloc kelly --tau 3.58 --eps 0.5 --refill nearest --curve_placebo"
   # confirmation runs for the simplified method M (8B with options, Kelly tau 3.58, eps 0.5)
   echo "q8_kelly_q3|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5 --model $Q3"
   echo "q8_kelly_q35|lvbench|.venv-q35|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0.5 --model Qwen/Qwen3.5-4B"
@@ -193,6 +227,7 @@ launch_arms() {
     n=$(rows "$name"); t=${ARM_TOTAL[$name]:-${TOTAL[$b]}}
     [ "$n" -ge "$t" ] && continue
     running "$name" && continue
+    grep -qF "\"$name\"" "$L/runner/plan.json" 2>/dev/null && continue   # nsp5_runner.py shards it
     # the eval is CPU-bound (~10 cores each, decoding long video): cap the concurrent processes
     [ "$(pyprocs | grep -c 'eval_lvbench_foveate.py')" -ge "${MAX_EVALS:-16}" ] && return
     heal "$name"
@@ -228,5 +263,9 @@ case "${1:-}" in
       [ "$left" -eq 0 ] && { echo "$(ts) every arm complete"; break; }
       sleep 300
     done ;;
-  *) echo "usage: $0 status | run [--dry-run]"; exit 2 ;;
+  arms)   # name|bench|venv|prerequisite|eval args|population, for nsp5_runner.py's plan
+    while IFS='|' read -r name b venv prereq args; do
+      echo "$name|$b|$venv|$prereq|$args|${ARM_TOTAL[$name]:-${TOTAL[$b]}}"
+    done < <(arms) ;;
+  *) echo "usage: $0 status | run [--dry-run] | arms"; exit 2 ;;
 esac

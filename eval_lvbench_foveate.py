@@ -278,6 +278,15 @@ def main() -> None:
                     help="placebo displacement in seconds; reported as realized at the end")
     ap.add_argument("--n_frames", type=int, default=64,
                     help="frame budget, identical across arms")
+    # The reference read's pixel settings. The defaults are this harness's protocol (14,336
+    # visual tokens shared by the frames); Study C (METHODS-LOG 2026-11-05) sets lmms-eval's
+    # Qwen2.5-VL defaults instead, which qwen_vl_utils caps at 768 tokens per frame.
+    ap.add_argument("--min_pixels", type=int, default=64 * 28 * 28,
+                    help="reference read: per-frame pixel floor")
+    ap.add_argument("--total_pixels", type=int, default=14336 * 28 * 28,
+                    help="reference read: pixel budget shared by the frames (0: qwen_vl_utils' default)")
+    ap.add_argument("--max_pixels", type=int, default=0,
+                    help="reference read: per-frame pixel cap to request (0: none requested)")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--parquet",
                     default="/home/mobeen/codes/active_repos/NeedleScan-vtg-landscape/"
@@ -485,11 +494,13 @@ def main() -> None:
                 # 1) Reference call at the frame budget: fixes N and the per-frame
                 #    resolution. Both arms inherit them, so only placement differs.
                 if item["video_path"] not in ref_memo:
-                    ref_msgs = [{"role": "user", "content": [
-                        {"type": "video", "video": item["video_path"],
-                         "nframes": args.n_frames, "min_pixels": 64 * 28 * 28,
-                         "total_pixels": 14336 * 28 * 28},
-                        {"type": "text", "text": "x"}]}]
+                    ref_video = {"type": "video", "video": item["video_path"],
+                                 "nframes": args.n_frames, "min_pixels": args.min_pixels}
+                    if args.total_pixels:
+                        ref_video["total_pixels"] = args.total_pixels
+                    if args.max_pixels:
+                        ref_video["max_pixels"] = args.max_pixels
+                    ref_msgs = [{"role": "user", "content": [ref_video, {"type": "text", "text": "x"}]}]
                     _, ref_videos = process_vision_info(ref_msgs, return_video_metadata=True)
                     ref_memo.clear()
                     ref_memo[item["video_path"]] = ref_videos[0]
