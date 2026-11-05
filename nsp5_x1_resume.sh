@@ -112,6 +112,19 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
     echo "${pre}gb32_f2c_topk|$b|.venv|$cc|--arm curve --curves $cc --alloc topk --refill nearest --topk_short uniform $gb"
     echo "${pre}gb32_q8_kelly_eps0|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0 --refill nearest $gb"
   done
+  # Study G (METHODS-LOG 2026-11-05, pre-registered): M2 against GMM-EVA's selection at other frame
+  # budgets, under the harness's shared token budget (14,336; qwen_vl_utils caps a frame pair at
+  # 768 tokens, so N=16 realizes about 6,144). N=64 is the existing q8_kelly_eps0 / f2c_topk_nr.
+  local n
+  for n in 16 32 128; do
+    for b in lvbench videomme lvb mlvu cgbench; do
+      pre=""; tag=""; [ $b != lvbench ] && { pre="x1_${b}_"; tag="${b}_"; }
+      q8=data/t1/priors/qwen3vl_emb_8b/${tag}curves_maxopt.npz
+      cc=data/t1/priors/qwen3vl_emb_8b/${tag}curves_concat.npz
+      echo "${pre}n${n}_q8_kelly_eps0|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0 --refill nearest --n_frames $n"
+      echo "${pre}n${n}_f2c_topk|$b|.venv|$cc|--arm curve --curves $cc --alloc topk --refill nearest --topk_short uniform --n_frames $n"
+    done
+  done
   local lv=data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz cg
   cg=$(q8b cgbench)
   echo "q8_kelly_eps0_q35|lvbench|.venv-q35|$lv|--arm curve --curves $lv --alloc kelly --tau 3.58 --eps 0 --refill nearest --model Qwen/Qwen3.5-4B"
