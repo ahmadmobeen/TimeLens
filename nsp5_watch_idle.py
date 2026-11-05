@@ -8,6 +8,8 @@ exits, which re-invokes the session that started it, on the first of:
   IDLE        a GPU outside skip_gpus has used under 1 GB for IDLE_MIN minutes while the runner
               has nothing pending (time to register the next study); a GPU idle that long while
               shards are pending is reported as ANOMALY instead;
+  QUEUE_LOW   at most LOW_PENDING shards wait to launch, reported once per plan size (time to
+              register the next study before GPUs idle);
   HEARTBEAT   HEARTBEAT_H hours without any of these.
 
 It prints the event and a short report: each GPU's memory and evals, and each study's progress.
@@ -24,7 +26,7 @@ import time
 TL = os.path.dirname(os.path.abspath(__file__))
 R = "logs/nsp5/runner"
 STATUS, SKIP, STATE = f"{R}/status.json", f"{R}/skip_gpus", f"{R}/watch_state.json"
-IDLE_MIN, STALE_MIN, HEARTBEAT_H, POLL_S, IDLE_MIB = 10, 10, 6, 60, 1000
+IDLE_MIN, STALE_MIN, HEARTBEAT_H, POLL_S, IDLE_MIB, LOW_PENDING = 10, 10, 6, 60, 1000, 6
 
 
 def load(path: str, default):
@@ -81,6 +83,13 @@ def main() -> None:
             seen["reported_studies"] += finished
             json.dump(seen, open(STATE, "w"))
             report("STUDY_DONE", f"studies {finished} complete", status)
+            return
+        # few shards left to launch: the next study should be registered now
+        n_arms = len(status.get("arms", []))
+        if n_arms and status.get("pending", 0) <= LOW_PENDING and seen.get("low_queue_for") != n_arms:
+            seen["low_queue_for"] = n_arms
+            json.dump(seen, open(STATE, "w"))
+            report("QUEUE_LOW", f"{status.get('pending', 0)} shards left to launch", status)
             return
         # idle GPUs
         skip = set()
