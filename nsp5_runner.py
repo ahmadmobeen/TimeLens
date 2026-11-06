@@ -19,6 +19,11 @@ the GPU with the fewest of my evals. Launches pause while the container uses mor
 of its 128 cores (measured over the last minute from the cgroup); an eval decodes video on about
 3 cores (2026-11-05), so GPU memory is usually the limit.
 
+Host memory. The container has a hard memory limit, and 24 evals once grew past it and took the
+pod down (2026-11-06). Launches pause while anonymous plus shared memory exceeds MEM_LAUNCH of
+the limit; above MEM_SHED the runner stops its eval with the largest resident set, which goes
+back to pending and later resumes. A shard stopped SHED_MAX times is reported as an anomaly.
+
 A shard killed by a signal goes back to pending. Once no shard of an arm runs or waits, the arm
 is merged: every line parses, keys are unique across files (a duplicate must agree on the
 answer) and the count equals "total"; shard files are kept as <file>.merged. An arm short of
@@ -31,6 +36,7 @@ Status goes to logs/nsp5/runner/status.json each minute, events to stdout.
 import json
 import os
 import shlex
+import signal
 import subprocess
 import time
 
@@ -41,7 +47,33 @@ PLAN, STATUS, SKIP = f"{R}/plan.json", f"{R}/status.json", f"{R}/skip_gpus"
 MAX_MINE, SHARED_MINE = 6, 2
 FREE_MIN, SHARED_FREE, RESERVE, PER_EVAL = 40000, 60000, 30000, 30000   # MiB
 CPU_STAT, CPU_LIMIT = "/sys/fs/cgroup/cpu.stat", 110                    # cores of the 128 quota
-RETRIES, LOOP_S = 2, 60
+MEM_STAT, MEM_MAX = "/sys/fs/cgroup/memory.stat", "/sys/fs/cgroup/memory.max"
+MEM_LAUNCH, MEM_SHED, SHED_MAX = 0.65, 0.85, 3                          # fractions of the limit
+RETRIES, LOOP_S, RSS_LOG_S = 2, 60, 1800
+
+
+def mem_use() -> tuple:
+    """(GiB, limit GiB) of the container's anonymous plus shared memory, which reclaiming page
+    cache cannot free; (None, None) if unreadable or unlimited."""
+    try:
+        limit = open(MEM_MAX).read().strip()
+        stat = dict(line.split() for line in open(MEM_STAT))
+        if limit == "max":
+            return None, None
+        return (int(stat["anon"]) + int(stat["shmem"])) / 2**30, int(limit) / 2**30
+    except (OSError, KeyError, ValueError):
+        return None, None
+
+
+def rss_gib(pid: int) -> float:
+    """Resident set of a process in GiB, 0 if it is gone."""
+    try:
+        for line in open(f"/proc/{pid}/status"):
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return 0.0
 
 
 def cpu_usec():
@@ -157,6 +189,9 @@ def main() -> None:
     attempts = {}     # arm name -> relaunch rounds
     done, anomalies = set(), []
     recent = {}       # GPU -> launch times
+    owner = {}        # out path -> arm name, for shards this process launched
+    sheds = {}        # out path -> times stopped for host memory
+    last_rss_log = 0.0
     last_cpu = (cpu_usec(), time.time())
     log(f"runner started, pid {os.getpid()}")
     while True:
@@ -242,19 +277,47 @@ def main() -> None:
                 ok = mine < MAX_MINE and room >= FREE_MIN
             gpu_status.append({"gpu": i, "used": used, "free": free, "mine": mine,
                                "shared": shared, "skip": i in skip, "takes": ok})
-        # one launch per eligible GPU per minute, the least loaded GPU first, while CPU allows
+        mem, limit = mem_use()
+        frac = mem / limit if mem is not None else 0.0
+        rss = {out: rss_gib(pid) for out, (pid, _) in running.items()}
+        top = sorted(rss.items(), key=lambda kv: -kv[1])[:5]
+        if now - last_rss_log >= RSS_LOG_S and mem is not None:
+            last_rss_log = now
+            log(f"memory {mem:.0f}/{limit:.0f} GiB; largest evals "
+                + ", ".join(f"{os.path.basename(o)} {g:.1f}" for o, g in top[:3]))
+        mine_running = [o for o in children if rss.get(o, 0) > 0]
+        if frac > MEM_SHED and mine_running:
+            out = max(mine_running, key=rss.get)
+            sheds[out] = sheds.get(out, 0) + 1
+            log(f"MEMSHED {out}: {rss[out]:.1f} GiB of {mem:.0f}/{limit:.0f} GiB; stopping it "
+                f"(stop {sheds[out]} of {SHED_MAX})")
+            try:
+                os.killpg(children[out].pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            name = owner.get(out)
+            if sheds[out] >= SHED_MAX and name and name not in anomalies:
+                anomalies.append(name)
+                log(f"ANOMALY {name}: shard {out} stopped {SHED_MAX} times for host memory")
+        # one launch per eligible GPU per minute, the least loaded GPU first, while CPU and host
+        # memory allow
         for g in sorted((s for s in gpu_status if s["takes"]), key=lambda s: (s["mine"], -s["free"])):
-            if not wanted or cores > CPU_LIMIT:
+            if not wanted or cores > CPU_LIMIT or frac > MEM_LAUNCH:
                 break
             arm, k = wanted.pop(0)
             out = files(arm)[k]
             children[out] = launch(arm, k, g["gpu"])
+            owner[out] = arm["name"]
             state[out] = "running"
             recent[g["gpu"]].append(now)
             log(f"launch {arm['name']} shard {k}/{arm['shards']} on GPU {g['gpu']} "
                 f"(pid {children[out].pid})")
         status = {"time": time.strftime("%F %T"), "pid": os.getpid(), "gpus": gpu_status,
-                  "cpu_cores": round(cores, 1), "running": len(running), "pending": len(wanted),
+                  "cpu_cores": round(cores, 1),
+                  "mem_gib": None if mem is None else round(mem, 1),
+                  "mem_limit_gib": None if limit is None else round(limit, 1),
+                  "rss_top": [[os.path.basename(o), round(g, 1)] for o, g in top],
+                  "running": len(running), "pending": len(wanted),
                   "anomalies": anomalies, "arms": arms_status}
         with open(STATUS + ".tmp", "w") as fh:
             json.dump(status, fh, indent=1)
