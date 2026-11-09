@@ -132,6 +132,21 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
     echo "h_uniform_q25_${m}b|lvbench|.venv||--arm uniform --model Qwen/Qwen2.5-VL-${m}B-Instruct"
     echo "h_q8_kelly_eps0_q25_${m}b|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0 --refill nearest --model Qwen/Qwen2.5-VL-${m}B-Instruct"
   done
+  # Study I (METHODS-LOG 2026-11-09, pre-registered): a review's controls. BOLT's rule on M2's scores
+  # at the exponent fitted by M2's likelihood (8.68, frozen from LVBench), M2 at four more
+  # temperatures, and uniform at Study G's other budgets.
+  local tt
+  for b in lvbench videomme lvb mlvu cgbench; do
+    pre=""; tag=""; [ $b != lvbench ] && { pre="x1_${b}_"; tag="${b}_"; }
+    q8=data/t1/priors/qwen3vl_emb_8b/${tag}curves_maxopt.npz
+    echo "${pre}q8_its_fit|$b|.venv|$q8|--arm curve --curves $q8 --alloc its --power 8.68"
+    for tt in 100:1.0 250:2.5 500:5.0 1000:10.0; do
+      echo "${pre}q8_kelly_eps0_tau${tt%%:*}|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau ${tt##*:} --eps 0 --refill nearest"
+    done
+    for n in 16 32 128; do
+      echo "${pre}n${n}_uniform|$b|.venv||--arm uniform --n_frames $n"
+    done
+  done
   local lv=data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz cg
   cg=$(q8b cgbench)
   echo "q8_kelly_eps0_q35|lvbench|.venv-q35|$lv|--arm curve --curves $lv --alloc kelly --tau 3.58 --eps 0 --refill nearest --model Qwen/Qwen3.5-4B"
