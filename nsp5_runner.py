@@ -52,7 +52,7 @@ MAX_MINE, SHARED_MINE = 6, 2
 FREE_MIN, SHARED_FREE, RESERVE, PER_EVAL = 40000, 60000, 30000, 30000   # MiB
 CPU_STAT, CPU_LIMIT = "/sys/fs/cgroup/cpu.stat", 110                    # cores of the 128 quota
 MEM_STAT, MEM_MAX = "/sys/fs/cgroup/memory.stat", "/sys/fs/cgroup/memory.max"
-MEM_LAUNCH, MEM_SHED, SHED_MAX = 0.65, 0.85, 3                          # fractions of the limit
+MEM_LAUNCH, MEM_SHED, SHED_MAX = 0.60, 0.80, 3                          # fractions of the limit
 RETRIES, LOOP_S, RSS_LOG_S = 2, 60, 1800
 EMPTY_MIB = 4000                    # a GPU using less than this has nothing on it
 
@@ -174,17 +174,25 @@ def merge(arm: dict) -> int:
 
 def place(wanted: list, gpu_status: list) -> list:
     """This minute's launches as (arm, shard, GPU), at most one per GPU, in plan order. A shard
-    takes the least loaded eligible GPU; an exclusive arm's shard needs one with nothing on it,
-    and while there is none the shards behind it wait."""
+    takes the least loaded eligible GPU. An exclusive arm's shard needs a GPU with nothing on it;
+    while there is none, the GPU with the fewest of my evals takes no new launches so that it
+    drains, and the shards behind the exclusive arm keep filling the other GPUs."""
     open_gpus = sorted((s for s in gpu_status if s["takes"]), key=lambda s: (s["mine"], -s["free"]))
-    out = []
+    out, draining = [], False
     for arm, k in wanted:
         if not open_gpus:
             break
         if arm.get("exclusive"):
+            if draining:
+                continue
             empty = [s for s in open_gpus if s["mine"] == 0 and s["used"] < EMPTY_MIB]
             if not empty:
-                break
+                busy = [s for s in gpu_status if not s["skip"] and not s["exclusive"]]
+                if busy:
+                    drain = min(busy, key=lambda s: (s["mine"], s["used"]))["gpu"]
+                    open_gpus = [s for s in open_gpus if s["gpu"] != drain]
+                draining = True
+                continue
             g = empty[0]
         else:
             g = open_gpus[0]
@@ -314,15 +322,17 @@ def main() -> None:
             last_rss_log = now
             log(f"memory {mem:.0f}/{limit:.0f} GiB; largest evals "
                 + ", ".join(f"{os.path.basename(o)} {g:.1f}" for o, g in top[:3]))
-        mine_running = [o for o in children if rss.get(o, 0) > 0]
+        # any running eval can be stopped, also one a previous runner launched (each eval leads
+        # its own process group); it goes back to pending and resumes from its partial file
+        mine_running = [o for o in running if rss.get(o, 0) > 0]
         if frac > MEM_SHED and mine_running:
             out = max(mine_running, key=rss.get)
             sheds[out] = sheds.get(out, 0) + 1
             log(f"MEMSHED {out}: {rss[out]:.1f} GiB of {mem:.0f}/{limit:.0f} GiB; stopping it "
                 f"(stop {sheds[out]} of {SHED_MAX})")
             try:
-                os.killpg(children[out].pid, signal.SIGTERM)
-            except ProcessLookupError:
+                os.killpg(os.getpgid(int(running[out][0])), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, ValueError):
                 pass
             name = owner.get(out)
             if sheds[out] >= SHED_MAX and name and name not in anomalies:
