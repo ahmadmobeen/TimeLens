@@ -3,10 +3,12 @@
 whose name matches the pattern joins logs/nsp5/runner/plan.json under the given study label,
 after the arms already there (the runner launches in plan order). Run it only once the study's
 registration is on GitHub. Shards per arm follow the benchmark's size. With --front the new arms
-go before every arm already planned, so their shards launch next.
+go before every arm already planned, so their shards launch next. With --exclusive each shard of
+the new arms needs a GPU to itself (a large answer model; see nsp5_runner.py).
 
     python3 nsp5_plan.py C 'pub32_'
     python3 nsp5_plan.py F 'gb32_' --front
+    python3 nsp5_plan.py H '^h_' --exclusive
 """
 import json
 import os
@@ -35,6 +37,8 @@ def main() -> None:
             sys.exit(f"{name}: missing {prereq}; nothing added")
         added.append({"name": name, "study": study, "bench": bench, "venv": venv,
                       "args": args, "shards": SHARDS[bench], "total": int(total)})
+        if "--exclusive" in sys.argv[3:]:
+            added[-1]["exclusive"] = True
     plan["arms"] = added + plan["arms"] if "--front" in sys.argv[3:] else plan["arms"] + added
     os.makedirs(os.path.dirname(PLAN), exist_ok=True)
     with open(PLAN + ".tmp", "w") as fh:

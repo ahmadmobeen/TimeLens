@@ -24,6 +24,10 @@ pod down (2026-11-06). Launches pause while anonymous plus shared memory exceeds
 the limit; above MEM_SHED the runner stops its eval with the largest resident set, which goes
 back to pending and later resumes. A shard stopped SHED_MAX times is reported as an anomaly.
 
+Exclusive arms. An arm marked "exclusive" in the plan (a large answer model such as a 72B that
+fills a GPU) launches only on a GPU with nothing on it, and no other eval joins that GPU while it
+runs. While no GPU is empty, the arms behind it in the plan wait, so GPUs drain for it.
+
 A shard killed by a signal goes back to pending. Once no shard of an arm runs or waits, the arm
 is merged: every line parses, keys are unique across files (a duplicate must agree on the
 answer) and the count equals "total"; shard files are kept as <file>.merged. An arm short of
@@ -50,6 +54,7 @@ CPU_STAT, CPU_LIMIT = "/sys/fs/cgroup/cpu.stat", 110                    # cores 
 MEM_STAT, MEM_MAX = "/sys/fs/cgroup/memory.stat", "/sys/fs/cgroup/memory.max"
 MEM_LAUNCH, MEM_SHED, SHED_MAX = 0.65, 0.85, 3                          # fractions of the limit
 RETRIES, LOOP_S, RSS_LOG_S = 2, 60, 1800
+EMPTY_MIB = 4000                    # a GPU using less than this has nothing on it
 
 
 def mem_use() -> tuple:
@@ -167,6 +172,27 @@ def merge(arm: dict) -> int:
     return len(rows)
 
 
+def place(wanted: list, gpu_status: list) -> list:
+    """This minute's launches as (arm, shard, GPU), at most one per GPU, in plan order. A shard
+    takes the least loaded eligible GPU; an exclusive arm's shard needs one with nothing on it,
+    and while there is none the shards behind it wait."""
+    open_gpus = sorted((s for s in gpu_status if s["takes"]), key=lambda s: (s["mine"], -s["free"]))
+    out = []
+    for arm, k in wanted:
+        if not open_gpus:
+            break
+        if arm.get("exclusive"):
+            empty = [s for s in open_gpus if s["mine"] == 0 and s["used"] < EMPTY_MIB]
+            if not empty:
+                break
+            g = empty[0]
+        else:
+            g = open_gpus[0]
+        open_gpus.remove(g)
+        out.append((arm, k, g["gpu"]))
+    return out
+
+
 def launch(arm: dict, k: int, gpu: int) -> subprocess.Popen:
     out = files(arm)[k]
     argv = [f"{arm['venv']}/bin/python", "-u", "eval_lvbench_foveate.py", "--bench", arm["bench"]]
@@ -263,20 +289,23 @@ def main() -> None:
         per_gpu = {}
         for _, g in running.values():
             per_gpu[g] = per_gpu.get(g, 0) + 1
+        exclusive_files = {p for arm in plan if arm.get("exclusive") for p in files(arm)}
+        exclusive_gpus = {g for out, (_, g) in running.items() if out in exclusive_files}
         gpu_status = []
         for i, used, free in gpus():
             mine = per_gpu.get(str(i), 0)
             recent[i] = [t for t in recent.get(i, []) if now - t < 600]
             shared = used > mine * PER_EVAL + 4000          # memory my evals cannot explain
             room = free - len(recent[i]) * RESERVE
-            if i in skip:
+            if i in skip or str(i) in exclusive_gpus:
                 ok = False
             elif shared:
                 ok = mine < SHARED_MINE and room >= SHARED_FREE
             else:
                 ok = mine < MAX_MINE and room >= FREE_MIN
             gpu_status.append({"gpu": i, "used": used, "free": free, "mine": mine,
-                               "shared": shared, "skip": i in skip, "takes": ok})
+                               "shared": shared, "skip": i in skip,
+                               "exclusive": str(i) in exclusive_gpus, "takes": ok})
         mem, limit = mem_use()
         frac = mem / limit if mem is not None else 0.0
         rss = {out: rss_gib(pid) for out, (pid, _) in running.items()}
@@ -299,19 +328,17 @@ def main() -> None:
             if sheds[out] >= SHED_MAX and name and name not in anomalies:
                 anomalies.append(name)
                 log(f"ANOMALY {name}: shard {out} stopped {SHED_MAX} times for host memory")
-        # one launch per eligible GPU per minute, the least loaded GPU first, while CPU and host
-        # memory allow
-        for g in sorted((s for s in gpu_status if s["takes"]), key=lambda s: (s["mine"], -s["free"])):
-            if not wanted or cores > CPU_LIMIT or frac > MEM_LAUNCH:
-                break
-            arm, k = wanted.pop(0)
-            out = files(arm)[k]
-            children[out] = launch(arm, k, g["gpu"])
-            owner[out] = arm["name"]
-            state[out] = "running"
-            recent[g["gpu"]].append(now)
-            log(f"launch {arm['name']} shard {k}/{arm['shards']} on GPU {g['gpu']} "
-                f"(pid {children[out].pid})")
+        # one launch per eligible GPU per minute, in plan order, while CPU and host memory allow
+        if cores <= CPU_LIMIT and frac <= MEM_LAUNCH:
+            for arm, k, gpu in place(wanted, gpu_status):
+                wanted.remove((arm, k))
+                out = files(arm)[k]
+                children[out] = launch(arm, k, gpu)
+                owner[out] = arm["name"]
+                state[out] = "running"
+                recent[gpu].append(now)
+                log(f"launch {arm['name']} shard {k}/{arm['shards']} on GPU {gpu} "
+                    f"(pid {children[out].pid})")
         status = {"time": time.strftime("%F %T"), "pid": os.getpid(), "gpus": gpu_status,
                   "cpu_cores": round(cores, 1),
                   "mem_gib": None if mem is None else round(mem, 1),

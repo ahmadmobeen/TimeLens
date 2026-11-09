@@ -125,6 +125,13 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
       echo "${pre}n${n}_f2c_topk|$b|.venv|$cc|--arm curve --curves $cc --alloc topk --refill nearest --topk_short uniform --n_frames $n"
     done
   done
+  # Study H (METHODS-LOG 2026-11-09, pre-registered): answer-model scale. Uniform and M2 on LVBench
+  # with Qwen2.5-VL-32B and -72B answering; each eval needs a GPU to itself (nsp5_plan.py --exclusive).
+  local m
+  for m in 32 72; do
+    echo "h_uniform_q25_${m}b|lvbench|.venv||--arm uniform --model Qwen/Qwen2.5-VL-${m}B-Instruct"
+    echo "h_q8_kelly_eps0_q25_${m}b|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0 --refill nearest --model Qwen/Qwen2.5-VL-${m}B-Instruct"
+  done
   local lv=data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz cg
   cg=$(q8b cgbench)
   echo "q8_kelly_eps0_q35|lvbench|.venv-q35|$lv|--arm curve --curves $lv --alloc kelly --tau 3.58 --eps 0 --refill nearest --model Qwen/Qwen3.5-4B"
