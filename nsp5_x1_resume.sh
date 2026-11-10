@@ -132,6 +132,10 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
     echo "h_uniform_q25_${m}b|lvbench|.venv||--arm uniform --model Qwen/Qwen2.5-VL-${m}B-Instruct"
     echo "h_q8_kelly_eps0_q25_${m}b|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0 --refill nearest --model Qwen/Qwen2.5-VL-${m}B-Instruct"
   done
+  # Study K (METHODS-LOG 2026-11-11, pre-registered): a non-Qwen answer model, Gemma-4-31B-it, on
+  # LVBench, uniform and M2; transformers >= 5.5 is needed, hence .venv-q35 (5.20.2).
+  echo "k_uniform_gemma4_31b|lvbench|.venv-q35||--arm uniform --model google/gemma-4-31B-it --cpu_threads 4 --prefetch 2"
+  echo "k_q8_kelly_eps0_gemma4_31b|lvbench|.venv-q35|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0 --refill nearest --model google/gemma-4-31B-it --cpu_threads 4 --prefetch 2"
   # Study J (METHODS-LOG 2026-11-10, pre-registered): Study H's 32B answer model on the other four
   # benchmarks, uniform and M2, one GPU per eval (nsp5_plan.py --exclusive). --cpu_threads and
   # --prefetch change no output (checked 2026-11-10 on logged questions).
