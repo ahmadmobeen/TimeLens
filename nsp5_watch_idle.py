@@ -24,7 +24,8 @@ import sys
 import time
 
 TL = os.path.dirname(os.path.abspath(__file__))
-R = "logs/nsp5/runner"
+R = os.environ.get("NSP5_RUNNER_DIR", "logs/nsp5/runner")   # the second node's runner: logs/nsp5/runner_b
+REMOTE = bool(os.environ.get("NSP5_REMOTE"))   # the runner is on another node: read its GPUs from its status
 STATUS, SKIP, STATE = f"{R}/status.json", f"{R}/skip_gpus", f"{R}/watch_state.json"
 IDLE_MIN, STALE_MIN, HEARTBEAT_H, POLL_S, IDLE_MIB, LOW_PENDING = 10, 10, 6, 60, 1000, 6
 
@@ -95,10 +96,13 @@ def main() -> None:
         skip = set()
         if os.path.exists(SKIP):
             skip = {int(x) for x in open(SKIP).read().replace(",", " ").split() if x.isdigit()}
-        q = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
-                           capture_output=True, text=True, timeout=60)
-        for line in q.stdout.strip().splitlines():
-            i, used = (int(x) for x in line.split(","))
+        if REMOTE:
+            rows = [(g["gpu"], g["used"]) for g in status.get("gpus", [])]
+        else:
+            q = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+                               capture_output=True, text=True, timeout=60)
+            rows = [tuple(int(x) for x in line.split(",")) for line in q.stdout.strip().splitlines()]
+        for i, used in rows:
             if used < IDLE_MIB and i not in skip:
                 idle_since.setdefault(i, now)
             else:

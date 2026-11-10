@@ -41,16 +41,29 @@ import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import time
 
 TL = os.path.dirname(os.path.abspath(__file__))
 L = "logs/nsp5"
-R = f"{L}/runner"
+R = os.environ.get("NSP5_RUNNER_DIR", f"{L}/runner")   # a second node runs its own plan here
 PLAN, STATUS, SKIP = f"{R}/plan.json", f"{R}/status.json", f"{R}/skip_gpus"
 MAX_MINE, SHARED_MINE = 6, 2
 FREE_MIN, SHARED_FREE, RESERVE, PER_EVAL = 40000, 60000, 30000, 30000   # MiB
-CPU_STAT, CPU_LIMIT = "/sys/fs/cgroup/cpu.stat", 110                    # cores of the 128 quota
+CPU_STAT = "/sys/fs/cgroup/cpu.stat"
+
+
+def _cpu_limit() -> float:
+    """86% of this container's CPU quota (110 of 128 cores on the first node)."""
+    try:
+        quota, period = open("/sys/fs/cgroup/cpu.max").read().split()
+        return 0.86 * (int(quota) / int(period) if quota != "max" else os.cpu_count())
+    except (OSError, ValueError):
+        return 110.0
+
+
+CPU_LIMIT = _cpu_limit()
 MEM_STAT, MEM_MAX = "/sys/fs/cgroup/memory.stat", "/sys/fs/cgroup/memory.max"
 MEM_LAUNCH, MEM_SHED, SHED_MAX = 0.60, 0.80, 3                          # fractions of the limit
 RETRIES, LOOP_S, RSS_LOG_S = 2, 60, 1800
@@ -357,7 +370,7 @@ def main() -> None:
                 recent[gpu].append(now)
                 log(f"launch {arm['name']} shard {k}/{arm['shards']} on GPU {gpu} "
                     f"(pid {children[out].pid})")
-        status = {"time": time.strftime("%F %T"), "pid": os.getpid(), "gpus": gpu_status,
+        status = {"time": time.strftime("%F %T"), "pid": os.getpid(), "host": socket.gethostname(), "gpus": gpu_status,
                   "cpu_cores": round(cores, 1),
                   "mem_gib": None if mem is None else round(mem, 1),
                   "mem_limit_gib": None if limit is None else round(limit, 1),
