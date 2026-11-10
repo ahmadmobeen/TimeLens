@@ -132,6 +132,14 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
     echo "h_uniform_q25_${m}b|lvbench|.venv||--arm uniform --model Qwen/Qwen2.5-VL-${m}B-Instruct"
     echo "h_q8_kelly_eps0_q25_${m}b|lvbench|.venv|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0 --refill nearest --model Qwen/Qwen2.5-VL-${m}B-Instruct"
   done
+  # Study J (METHODS-LOG 2026-11-10, pre-registered): Study H's 32B answer model on the other four
+  # benchmarks, uniform and M2, one GPU per eval (nsp5_plan.py --exclusive). --cpu_threads and
+  # --prefetch change no output (checked 2026-11-10 on logged questions).
+  for b in videomme lvb mlvu cgbench; do
+    q8=data/t1/priors/qwen3vl_emb_8b/${b}_curves_maxopt.npz
+    echo "x1_${b}_h_uniform_q25_32b|$b|.venv||--arm uniform --model Qwen/Qwen2.5-VL-32B-Instruct --cpu_threads 4 --prefetch 2"
+    echo "x1_${b}_h_q8_kelly_eps0_q25_32b|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0 --refill nearest --model Qwen/Qwen2.5-VL-32B-Instruct --cpu_threads 4 --prefetch 2"
+  done
   # Study I (METHODS-LOG 2026-11-09, pre-registered): a review's controls. BOLT's rule on M2's scores
   # at the exponent fitted by M2's likelihood (8.68, frozen from LVBench), M2 at four more
   # temperatures, and uniform at Study G's other budgets.
