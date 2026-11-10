@@ -32,6 +32,9 @@ Run (TimeLens venv, from research/TimeLens, PYTHONPATH=.):
 from __future__ import annotations
 
 import argparse
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -349,10 +352,15 @@ def main() -> None:
                     help="K/N: answer only the videos whose order of first appearance is K mod N, "
                          "so N processes can split one arm; a video's questions stay together "
                          "and the per-question computation is unchanged")
+    ap.add_argument("--prefetch", type=int, default=0,
+                    help="read the frames of the next K questions in K threads while the GPU "
+                         "answers; the reads are deterministic, so every output is unchanged")
     ap.add_argument("--skip_done", nargs="*", default=[],
                     help="other jsonl files whose questions count as done (a shard resuming "
                          "past the rows its arm wrote before it was split)")
     args = ap.parse_args()
+    if args.prefetch and (args.center == "prior" or args.arm == "topk_siglip"):
+        ap.error("--prefetch reads on the CPU only; --center prior and --arm topk_siglip use the GPU there")
 
     if args.bench == "lvbench":
         items, census = load_questions(args.parquet, args.meta, args.video_dir)
@@ -481,96 +489,120 @@ def main() -> None:
 
     # The reference call depends only on the video, and questions arrive grouped by
     # video (~15 each), so it is decoded once per video rather than once per question.
-    # Same tensors, same metadata: a speedup, not a protocol change.
-    ref_memo: dict[str, tuple] = {}
-    vr_memo: dict = {}
+    # Same tensors, same metadata: a speedup, not a protocol change. With --prefetch each
+    # reading thread keeps its own memo and reader, and the reads run ahead of the answers.
+    local = threading.local()
+
+    def read(item: dict) -> dict:
+        """Steps 1 and 2 for one question: the reference read, the placement, and the frames at
+        the chosen indices. Deterministic and CPU-only (bar --center prior and topk_siglip, which
+        --prefetch refuses), so with --prefetch it runs ahead of the GPU in a thread."""
+        if not hasattr(local, "ref_memo"):
+            local.ref_memo, local.vr_memo = {}, {}
+        ref_memo, vr_memo = local.ref_memo, local.vr_memo
+        key = item["rkey"]
+        # 1) Reference call at the frame budget: fixes N and the per-frame
+        #    resolution. Both arms inherit them, so only placement differs.
+        if item["video_path"] not in ref_memo:
+            ref_video = {"type": "video", "video": item["video_path"],
+                         "nframes": args.n_frames, "min_pixels": args.min_pixels}
+            if args.total_pixels:
+                ref_video["total_pixels"] = args.total_pixels
+            if args.max_pixels:
+                ref_video["max_pixels"] = args.max_pixels
+            ref_msgs = [{"role": "user", "content": [ref_video, {"type": "text", "text": "x"}]}]
+            _, ref_videos = process_vision_info(ref_msgs, return_video_metadata=True)
+            ref_memo.clear()
+            ref_memo[item["video_path"]] = ref_videos[0]
+        ref_tensor, meta = ref_memo[item["video_path"]]
+        n, _, H, W = ref_tensor.shape
+        native_fps = float(meta["fps"])
+        total = int(meta["total_num_frames"])
+        dur = total / native_fps
+
+        # 2) Place N frames by the kernel, then read exactly those indices.
+        if args.center == "prior":
+            center, prior_err = prior_center(
+                ref_tensor, dur, item["question"], prior_model, prior_proc,
+                item["center"])
+        else:
+            center = min(max(item["center"], 0.0), dur)
+            prior_err = None
+        if args.arm in ("uniform", "topk_siglip", "curve"):
+            # topk_siglip only needs n and the frame grid here; the actual
+            # indices are replaced by the SigLIP selection below.
+            times = kernel_times("uniform", center, dur, n)
+        else:
+            times = kernel_times(args.arm, center, dur, n,
+                                 offpeak_shift=args.offpeak_shift)
+        if args.arm.startswith("offpeak"):
+            realized.append(abs(min(dur, center + args.offpeak_shift) - center))
+        if args.arm == "curve":
+            times = curve_times(curves[curve_of[key]], dur, n, args.alloc,
+                                args.tau, args.eps, power=args.power,
+                                aks=(args.aks_t1, args.aks_t2, args.aks_depth),
+                                short_uniform=args.topk_short == "uniform")
+        idx = (times_to_indices_nearest if args.refill == "nearest" else times_to_indices)(
+            times, native_fps, total, n)
+        # frames the budget refill supplied: times that fell on an already-taken source
+        # frame, plus any shortfall (from the start of the video, or with --refill nearest
+        # from the nearest unused frames)
+        n_refill = (n - len({min(total - 1, max(0, round(t * native_fps))) for t in times})
+                    if args.arm == "curve" else None)
+        if vr_memo.get("path") != item["video_path"]:   # one reader per video
+            vr_memo.update(path=item["video_path"], vr=VideoReader(item["video_path"]))
+        vr = vr_memo["vr"]
+
+        if args.arm == "topk_siglip":
+            # Score a denser uniform scan, keep the n best frames. This is the
+            # field's dominant recipe: plain argmax top-k captures ~88% of the
+            # reported gain, every published aggregation adding ~+0.9 on top.
+            scan = [min(total - 1, int(total * (i + 0.5) / args.scan_frames))
+                    for i in range(args.scan_frames)]
+            sf = torch.from_numpy(vr.get_batch(scan).asnumpy()).permute(0, 3, 1, 2)
+            sf = torch.nn.functional.interpolate(
+                sf.float(), size=(384, 384), mode="bilinear",
+                align_corners=False, antialias=True).clamp(0, 255)
+            qtext = scoring_text.get(item["key"] + item["uid"], item["question"])
+            stem = qtext.split("\n(A)")[0].strip() or qtext.strip()
+            with torch.no_grad():
+                bt = prior_proc(text=[stem],
+                                images=[sf[i].permute(1, 2, 0).to(torch.uint8).cpu().numpy()
+                                        for i in range(sf.shape[0])],
+                                padding="max_length", truncation=True,
+                                return_tensors="pt").to("cuda")
+                sim = prior_model(**bt).logits_per_text[0].float()
+            best = torch.topk(sim, min(n, len(scan))).indices.tolist()
+            idx = sorted({scan[i] for i in best})
+
+        frames = torch.from_numpy(vr.get_batch(idx).asnumpy()).permute(0, 3, 1, 2)
+        frames = torch.nn.functional.interpolate(
+            frames.float(), size=(H, W), mode="bicubic",
+            align_corners=False, antialias=True).clamp(0, 255).to(ref_tensor.dtype)
+        vmeta = {"fps": native_fps, "frames_indices": idx,
+                 "total_num_frames": total, "video_backend": "decord"}
+        return {"center": center, "prior_err": prior_err, "dur": dur, "idx": idx,
+                "n_refill": n_refill, "native_fps": native_fps, "frames": frames, "vmeta": vmeta}
+
+    pending = [item for item in items if item["rkey"] not in done]
+    pool = ThreadPoolExecutor(args.prefetch) if args.prefetch else None
+    ahead: deque = deque()
+    submitted = 0
 
     with open(args.out, "a", encoding="utf-8") as out_fh:
-        for item in items:
+        for j, item in enumerate(pending):
             key = item["rkey"]
-            if key in done:
-                continue
             try:
-                # 1) Reference call at the frame budget: fixes N and the per-frame
-                #    resolution. Both arms inherit them, so only placement differs.
-                if item["video_path"] not in ref_memo:
-                    ref_video = {"type": "video", "video": item["video_path"],
-                                 "nframes": args.n_frames, "min_pixels": args.min_pixels}
-                    if args.total_pixels:
-                        ref_video["total_pixels"] = args.total_pixels
-                    if args.max_pixels:
-                        ref_video["max_pixels"] = args.max_pixels
-                    ref_msgs = [{"role": "user", "content": [ref_video, {"type": "text", "text": "x"}]}]
-                    _, ref_videos = process_vision_info(ref_msgs, return_video_metadata=True)
-                    ref_memo.clear()
-                    ref_memo[item["video_path"]] = ref_videos[0]
-                ref_tensor, meta = ref_memo[item["video_path"]]
-                n, _, H, W = ref_tensor.shape
-                native_fps = float(meta["fps"])
-                total = int(meta["total_num_frames"])
-                dur = total / native_fps
-
-                # 2) Place N frames by the kernel, then read exactly those indices.
-                if args.center == "prior":
-                    center, prior_err = prior_center(
-                        ref_tensor, dur, item["question"], prior_model, prior_proc,
-                        item["center"])
+                if pool:   # keep the next --prefetch reads in flight, consume them in order
+                    while submitted < len(pending) and submitted <= j + args.prefetch:
+                        ahead.append(pool.submit(read, pending[submitted]))
+                        submitted += 1
+                    r = ahead.popleft().result()
                 else:
-                    center = min(max(item["center"], 0.0), dur)
-                    prior_err = None
-                if args.arm in ("uniform", "topk_siglip", "curve"):
-                    # topk_siglip only needs n and the frame grid here; the actual
-                    # indices are replaced by the SigLIP selection below.
-                    times = kernel_times("uniform", center, dur, n)
-                else:
-                    times = kernel_times(args.arm, center, dur, n,
-                                         offpeak_shift=args.offpeak_shift)
-                if args.arm.startswith("offpeak"):
-                    realized.append(abs(min(dur, center + args.offpeak_shift) - center))
-                if args.arm == "curve":
-                    times = curve_times(curves[curve_of[key]], dur, n, args.alloc,
-                                        args.tau, args.eps, power=args.power,
-                                        aks=(args.aks_t1, args.aks_t2, args.aks_depth),
-                                        short_uniform=args.topk_short == "uniform")
-                idx = (times_to_indices_nearest if args.refill == "nearest" else times_to_indices)(
-                    times, native_fps, total, n)
-                # frames the budget refill supplied: times that fell on an already-taken source
-                # frame, plus any shortfall (from the start of the video, or with --refill nearest
-                # from the nearest unused frames)
-                n_refill = (n - len({min(total - 1, max(0, round(t * native_fps))) for t in times})
-                            if args.arm == "curve" else None)
-                if vr_memo.get("path") != item["video_path"]:   # one reader per video
-                    vr_memo.update(path=item["video_path"], vr=VideoReader(item["video_path"]))
-                vr = vr_memo["vr"]
-
-                if args.arm == "topk_siglip":
-                    # Score a denser uniform scan, keep the n best frames. This is the
-                    # field's dominant recipe: plain argmax top-k captures ~88% of the
-                    # reported gain, every published aggregation adding ~+0.9 on top.
-                    scan = [min(total - 1, int(total * (i + 0.5) / args.scan_frames))
-                            for i in range(args.scan_frames)]
-                    sf = torch.from_numpy(vr.get_batch(scan).asnumpy()).permute(0, 3, 1, 2)
-                    sf = torch.nn.functional.interpolate(
-                        sf.float(), size=(384, 384), mode="bilinear",
-                        align_corners=False, antialias=True).clamp(0, 255)
-                    qtext = scoring_text.get(item["key"] + item["uid"], item["question"])
-                    stem = qtext.split("\n(A)")[0].strip() or qtext.strip()
-                    with torch.no_grad():
-                        bt = prior_proc(text=[stem],
-                                        images=[sf[i].permute(1, 2, 0).to(torch.uint8).cpu().numpy()
-                                                for i in range(sf.shape[0])],
-                                        padding="max_length", truncation=True,
-                                        return_tensors="pt").to("cuda")
-                        sim = prior_model(**bt).logits_per_text[0].float()
-                    best = torch.topk(sim, min(n, len(scan))).indices.tolist()
-                    idx = sorted({scan[i] for i in best})
-
-                frames = torch.from_numpy(vr.get_batch(idx).asnumpy()).permute(0, 3, 1, 2)
-                frames = torch.nn.functional.interpolate(
-                    frames.float(), size=(H, W), mode="bicubic",
-                    align_corners=False, antialias=True).clamp(0, 255).to(ref_tensor.dtype)
-                vmeta = {"fps": native_fps, "frames_indices": idx,
-                         "total_num_frames": total, "video_backend": "decord"}
+                    r = read(item)
+                center, prior_err, dur, idx = r["center"], r["prior_err"], r["dur"], r["idx"]
+                n_refill, native_fps = r["n_refill"], r["native_fps"]
+                frames, vmeta = r["frames"], r["vmeta"]
 
                 # 3) Ask the multiple-choice question over exactly those frames.
                 messages = [{"role": "user", "content": [
@@ -629,6 +661,8 @@ def main() -> None:
                 print(f"  [{n_done}/{len(items)}] acc {correct / n_done:.4f} "
                       f"(skipped {skipped}, unparsed {unparsed})", flush=True)
 
+    if pool:
+        pool.shutdown(wait=False, cancel_futures=True)
     acc = correct / n_done if n_done else float("nan")
     print(f"DONE {args.arm}: n={n_done} acc={acc:.4f} skipped={skipped} "
           f"unparsed={unparsed} -> {args.out}", flush=True)
