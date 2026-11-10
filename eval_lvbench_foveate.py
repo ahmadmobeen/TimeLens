@@ -355,10 +355,18 @@ def main() -> None:
     ap.add_argument("--prefetch", type=int, default=0,
                     help="read the frames of the next K questions in K threads while the GPU "
                          "answers; the reads are deterministic, so every output is unchanged")
+    ap.add_argument("--cpu_threads", type=int, default=0,
+                    help="cap torch's CPU threads and each video reader's decode threads at N; "
+                         "0 keeps the library defaults, which start one thread per visible core "
+                         "(224 on the pods) whatever the container's CPU quota. Outputs are "
+                         "unchanged: 30 logged CG-Bench questions gave identical answers and "
+                         "option probabilities with 4, alone and with --prefetch 4 (2026-11-10)")
     ap.add_argument("--skip_done", nargs="*", default=[],
                     help="other jsonl files whose questions count as done (a shard resuming "
                          "past the rows its arm wrote before it was split)")
     args = ap.parse_args()
+    if args.cpu_threads:
+        torch.set_num_threads(args.cpu_threads)
     if args.prefetch and (args.center == "prior" or args.arm == "topk_siglip"):
         ap.error("--prefetch reads on the CPU only; --center prior and --arm topk_siglip use the GPU there")
 
@@ -550,7 +558,8 @@ def main() -> None:
         n_refill = (n - len({min(total - 1, max(0, round(t * native_fps))) for t in times})
                     if args.arm == "curve" else None)
         if vr_memo.get("path") != item["video_path"]:   # one reader per video
-            vr_memo.update(path=item["video_path"], vr=VideoReader(item["video_path"]))
+            vr_memo.update(path=item["video_path"],
+                           vr=VideoReader(item["video_path"], num_threads=args.cpu_threads))
         vr = vr_memo["vr"]
 
         if args.arm == "topk_siglip":
