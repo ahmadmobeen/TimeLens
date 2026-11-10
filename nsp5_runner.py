@@ -55,6 +55,8 @@ MEM_STAT, MEM_MAX = "/sys/fs/cgroup/memory.stat", "/sys/fs/cgroup/memory.max"
 MEM_LAUNCH, MEM_SHED, SHED_MAX = 0.60, 0.80, 3                          # fractions of the limit
 RETRIES, LOOP_S, RSS_LOG_S = 2, 60, 1800
 EMPTY_MIB = 4000                    # a GPU using less than this has nothing on it
+MAX_EXCLUSIVE = 2                   # GPUs that may run an exclusive (large-model) eval at once
+COTENANTS, COTENANT_FREE = 3, 50000 # small evals beside a loaded exclusive eval, MiB left free
 
 
 def mem_use() -> tuple:
@@ -179,11 +181,12 @@ def place(wanted: list, gpu_status: list) -> list:
     drains, and the shards behind the exclusive arm keep filling the other GPUs."""
     open_gpus = sorted((s for s in gpu_status if s["takes"]), key=lambda s: (s["mine"], -s["free"]))
     out, draining = [], False
+    n_exclusive = sum(1 for s in gpu_status if s["exclusive"])
     for arm, k in wanted:
         if not open_gpus:
             break
         if arm.get("exclusive"):
-            if draining:
+            if draining or n_exclusive >= MAX_EXCLUSIVE:
                 continue
             empty = [s for s in open_gpus if s["mine"] == 0 and s["used"] < EMPTY_MIB]
             if not empty:
@@ -194,6 +197,7 @@ def place(wanted: list, gpu_status: list) -> list:
                 draining = True
                 continue
             g = empty[0]
+            n_exclusive += 1
         else:
             g = open_gpus[0]
         open_gpus.remove(g)
@@ -305,8 +309,12 @@ def main() -> None:
             recent[i] = [t for t in recent.get(i, []) if now - t < 600]
             shared = used > mine * PER_EVAL + 4000          # memory my evals cannot explain
             room = free - len(recent[i]) * RESERVE
-            if i in skip or str(i) in exclusive_gpus:
+            if i in skip:
                 ok = False
+            elif str(i) in exclusive_gpus:
+                # beside a large model, once it has loaded (no launch here for 10 minutes) and
+                # while enough memory stays free; a 72B model leaves too little, a 32B room for some
+                ok = not recent[i] and mine - 1 < COTENANTS and room >= COTENANT_FREE
             elif shared:
                 ok = mine < SHARED_MINE and room >= SHARED_FREE
             else:
