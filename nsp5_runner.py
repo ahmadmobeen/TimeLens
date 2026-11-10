@@ -65,7 +65,8 @@ def _cpu_limit() -> float:
 
 CPU_LIMIT = _cpu_limit()
 MEM_STAT, MEM_MAX = "/sys/fs/cgroup/memory.stat", "/sys/fs/cgroup/memory.max"
-MEM_LAUNCH, MEM_SHED, SHED_MAX = 0.60, 0.80, 3                          # fractions of the limit
+MEM_LAUNCH, MEM_SHED, SHED_MAX = 0.75, 0.90, 3                          # fractions of the limit
+MEM_POLL_S = 10                     # between rounds, host memory is read this often
 RETRIES, LOOP_S, RSS_LOG_S = 2, 60, 1800
 EMPTY_MIB = 4000                    # a GPU using less than this has nothing on it
 MAX_EXCLUSIVE = 2                   # GPUs that may run an exclusive (large-model) eval at once
@@ -242,6 +243,7 @@ def main() -> None:
     recent = {}       # GPU -> launch times
     owner = {}        # out path -> arm name, for shards this process launched
     sheds = {}        # out path -> times stopped for host memory
+    last_shed = 0.0   # a stopped eval needs a moment to exit and free its memory
     last_rss_log = 0.0
     last_cpu = (cpu_usec(), time.time())
     log(f"runner started, pid {os.getpid()}")
@@ -346,7 +348,8 @@ def main() -> None:
         # any running eval can be stopped, also one a previous runner launched (each eval leads
         # its own process group); it goes back to pending and resumes from its partial file
         mine_running = [o for o in running if rss.get(o, 0) > 0]
-        if frac > MEM_SHED and mine_running:
+        if frac > MEM_SHED and mine_running and now - last_shed >= 30:
+            last_shed = now
             out = max(mine_running, key=rss.get)
             sheds[out] = sheds.get(out, 0) + 1
             log(f"MEMSHED {out}: {rss[out]:.1f} GiB of {mem:.0f}/{limit:.0f} GiB; stopping it "
@@ -380,7 +383,14 @@ def main() -> None:
         with open(STATUS + ".tmp", "w") as fh:
             json.dump(status, fh, indent=1)
         os.replace(STATUS + ".tmp", STATUS)
-        time.sleep(LOOP_S)
+        # wait for the next round, but start it at once if host memory crosses the stop line, so
+        # a fast-growing eval is stopped within seconds rather than a minute
+        until = time.time() + LOOP_S
+        while time.time() < until:
+            time.sleep(MEM_POLL_S)
+            m, lim = mem_use()
+            if m is not None and m / lim > MEM_SHED:
+                break
 
 
 if __name__ == "__main__":
