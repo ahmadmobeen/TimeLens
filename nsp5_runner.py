@@ -69,7 +69,9 @@ MEM_LAUNCH, MEM_SHED, SHED_MAX = 0.75, 0.90, 3                          # fracti
 MEM_POLL_S = 10                     # between rounds, host memory is read this often
 RETRIES, LOOP_S, RSS_LOG_S = 2, 60, 1800
 EMPTY_MIB = 4000                    # a GPU using less than this has nothing on it
-MAX_EXCLUSIVE = 2                   # GPUs that may run an exclusive (large-model) eval at once
+# GPUs that may run an exclusive (large-model) eval at once; raise it (NSP5_MAX_EXCLUSIVE) when the
+# plan holds only large-model arms, so no GPU idles behind the cap
+MAX_EXCLUSIVE = int(os.environ.get("NSP5_MAX_EXCLUSIVE", "2"))
 COTENANTS, COTENANT_FREE = 3, 50000 # small evals beside a loaded exclusive eval, MiB left free
 
 
