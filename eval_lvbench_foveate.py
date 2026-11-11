@@ -38,6 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
+import zlib
 
 import torch
 from decord import VideoReader
@@ -136,7 +137,7 @@ def times_to_indices_nearest(times: list[float], native_fps: float, total: int, 
 
 def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float, power: float = 3.0,
                 aks: tuple[float, float, int] = (0.8, -100.0, 5),
-                short_uniform: bool = False) -> list[float]:
+                short_uniform: bool = False, seed: int = 0, candidates: int = 128) -> list[float]:
     """Frame times from a per-second score curve (second k covers [k, k+1)).
 
     topk   the n highest-scoring seconds. A video shorter than n seconds gets one frame per
@@ -159,6 +160,20 @@ def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float, power
     import numpy as np
     z = np.asarray(z, dtype=np.float64)[:max(1, int(np.ceil(dur)))]
     T = len(z)
+    if alloc == "qframe":
+        # Q-Frame (ICCV 2025, arXiv 2506.22139, Eqs. 3-5; no code released): `candidates` uniform
+        # candidate frames (its protocol: 128; 0 = every second), softmax(z / tau) over them, and
+        # the n largest of log-probability plus Gumbel noise, i.e. n draws without replacement.
+        # The noise is seeded per question, so a rerun repeats the same frames.
+        rng = np.random.default_rng(seed)
+        cand = (np.array([dur * (i + 0.5) / candidates for i in range(candidates)])
+                if candidates > 0 else np.arange(T) + 0.5)
+        logits = z[np.minimum(cand.astype(int), T - 1)] / tau
+        picks: list[float] = []
+        while len(picks) < n:                    # a fresh draw only when n exceeds the candidates
+            order = np.argsort(-(logits + rng.gumbel(size=len(cand))), kind="stable")
+            picks += [float(cand[j]) for j in order[:n - len(picks)]]
+        return sorted(min(dur - 1e-3, t) for t in picks)
     if alloc == "topk":
         if short_uniform and T < n:
             return [dur * (i + 0.5) / n for i in range(n)]
@@ -320,7 +335,9 @@ def main() -> None:
     ap.add_argument("--curves", default="",
                     help="curve arm: npz of per-second score curves keyed "
                          "'lvbench:<key>>>><uid>' (t1_train.py eval_lvbench writes them)")
-    ap.add_argument("--alloc", choices=["topk", "kelly", "its", "aks"], default="kelly",
+    ap.add_argument("--qframe_candidates", type=int, default=128,
+                    help="qframe: uniform candidate frames (Q-Frame's protocol: 128); 0 = every second")
+    ap.add_argument("--alloc", choices=["topk", "kelly", "its", "aks", "qframe"], default="kelly",
                     help="curve arm: how a curve becomes frame times (see curve_times); its = "
                          "BOLT's inverse transform sampling, aks = AKS's judge-and-split")
     ap.add_argument("--power", type=float, default=3.0, help="its: BOLT's exponent")
@@ -556,7 +573,9 @@ def main() -> None:
             times = curve_times(curves[curve_of[key]], dur, n, args.alloc,
                                 args.tau, args.eps, power=args.power,
                                 aks=(args.aks_t1, args.aks_t2, args.aks_depth),
-                                short_uniform=args.topk_short == "uniform")
+                                short_uniform=args.topk_short == "uniform",
+                                seed=zlib.crc32(f"{args.seed}:{key}".encode()),
+                                candidates=args.qframe_candidates)
         idx = (times_to_indices_nearest if args.refill == "nearest" else times_to_indices)(
             times, native_fps, total, n)
         # frames the budget refill supplied: times that fell on an already-taken source

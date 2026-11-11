@@ -145,6 +145,15 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
     echo "${pre}l_uniform_plm8b|$b|.venv||--arm uniform --n_frames 32 --model facebook/Perception-LM-8B --cpu_threads 4 --prefetch 2"
     echo "${pre}l_q8_kelly_eps0_plm8b|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0 --refill nearest --n_frames 32 --model facebook/Perception-LM-8B --cpu_threads 4 --prefetch 2"
   done
+  # Study M (METHODS-LOG 2026-11-11, pre-registered): Q-Frame's selection rule (ICCV 2025; no code
+  # released) on M2's probability, Qwen2.5-VL-7B answering: the n largest of log softmax(z / tau)
+  # plus Gumbel noise, over 128 uniform candidate frames (its protocol) or over every second.
+  for b in lvbench videomme lvb mlvu cgbench; do
+    pre=""; tag=""; [ $b != lvbench ] && { pre="x1_${b}_"; tag="${b}_"; }
+    q8=data/t1/priors/qwen3vl_emb_8b/${tag}curves_maxopt.npz
+    echo "${pre}m_qframe128_q8|$b|.venv|$q8|--arm curve --curves $q8 --alloc qframe --tau 3.58 --qframe_candidates 128 --refill nearest --cpu_threads 4 --prefetch 2"
+    echo "${pre}m_qframe_all_q8|$b|.venv|$q8|--arm curve --curves $q8 --alloc qframe --tau 3.58 --qframe_candidates 0 --refill nearest --cpu_threads 4 --prefetch 2"
+  done
   # Study J (METHODS-LOG 2026-11-10, pre-registered): Study H's 32B answer model on the other four
   # benchmarks, uniform and M2, one GPU per eval (nsp5_plan.py --exclusive). --cpu_threads and
   # --prefetch change no output (checked 2026-11-10 on logged questions).

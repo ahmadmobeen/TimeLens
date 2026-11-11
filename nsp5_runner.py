@@ -65,7 +65,11 @@ def _cpu_limit() -> float:
 
 CPU_LIMIT = _cpu_limit()
 MEM_STAT, MEM_MAX = "/sys/fs/cgroup/memory.stat", "/sys/fs/cgroup/memory.max"
-MEM_LAUNCH, MEM_SHED, SHED_MAX = 0.75, 0.90, 3                          # fractions of the limit
+# fractions of the limit; lower them (NSP5_MEM_LAUNCH, NSP5_MEM_SHED) when evals can spike by hundreds
+# of GiB within a minute (qwen_vl_utils' torchvision fallback reads a whole video, 2026-11-11)
+MEM_LAUNCH = float(os.environ.get("NSP5_MEM_LAUNCH", "0.75"))
+MEM_SHED = float(os.environ.get("NSP5_MEM_SHED", "0.90"))
+SHED_MAX = 3
 MEM_POLL_S = 10                     # between rounds, host memory is read this often
 RETRIES, LOOP_S, RSS_LOG_S = 2, 60, 1800
 EMPTY_MIB = 4000                    # a GPU using less than this has nothing on it
