@@ -161,7 +161,7 @@ def main() -> None:
     ap.add_argument("--curves", default="", help="tau: the LVBench curves .npz")
     ap.add_argument("--out", default="", help="tau: where to write the json")
     ap.add_argument("--bench", default="lvbench",
-                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench"])
+                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench", "cgbench_cal"])
     ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
     tag = "" if args.bench == "lvbench" else f"{args.bench}_"
