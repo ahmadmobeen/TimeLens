@@ -17,7 +17,7 @@ import subprocess
 import sys
 
 TL = os.path.dirname(os.path.abspath(__file__))
-PLAN = "logs/nsp5/runner/plan.json"
+PLAN = os.environ.get("NSP5_RUNNER_DIR", "logs/nsp5/runner") + "/plan.json"   # second node: runner_b
 SHARDS = {"lvbench": 2, "videomme": 3, "lvb": 2, "mlvu": 2, "cgbench": 3}
 
 

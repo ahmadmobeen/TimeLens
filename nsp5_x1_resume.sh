@@ -136,6 +136,15 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
   # LVBench, uniform and M2; transformers >= 5.5 is needed, hence .venv-q35 (5.20.2).
   echo "k_uniform_gemma4_31b|lvbench|.venv-q35||--arm uniform --model google/gemma-4-31B-it --cpu_threads 4 --prefetch 2"
   echo "k_q8_kelly_eps0_gemma4_31b|lvbench|.venv-q35|data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz|--arm curve --curves data/t1/priors/qwen3vl_emb_8b/curves_maxopt.npz --alloc kelly --tau 3.58 --eps 0 --refill nearest --model google/gemma-4-31B-it --cpu_threads 4 --prefetch 2"
+  # Study L (METHODS-LOG 2026-11-11, pre-registered): a second non-Qwen answer model,
+  # Perception-LM-8B (Llama-3.1-8B with Meta's Perception Encoder), uniform and M2 on all five
+  # benchmarks at 32 frames, since its 11,520-token context cannot hold 64 frames of 256 tokens.
+  for b in lvbench videomme lvb mlvu cgbench; do
+    pre=""; tag=""; [ $b != lvbench ] && { pre="x1_${b}_"; tag="${b}_"; }
+    q8=data/t1/priors/qwen3vl_emb_8b/${tag}curves_maxopt.npz
+    echo "${pre}l_uniform_plm8b|$b|.venv||--arm uniform --n_frames 32 --model facebook/Perception-LM-8B --cpu_threads 4 --prefetch 2"
+    echo "${pre}l_q8_kelly_eps0_plm8b|$b|.venv|$q8|--arm curve --curves $q8 --alloc kelly --tau 3.58 --eps 0 --refill nearest --n_frames 32 --model facebook/Perception-LM-8B --cpu_threads 4 --prefetch 2"
+  done
   # Study J (METHODS-LOG 2026-11-10, pre-registered): Study H's 32B answer model on the other four
   # benchmarks, uniform and M2, one GPU per eval (nsp5_plan.py --exclusive). --cpu_threads and
   # --prefetch change no output (checked 2026-11-10 on logged questions).

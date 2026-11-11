@@ -42,7 +42,7 @@ import re
 import torch
 from decord import VideoReader
 from qwen_vl_utils import process_vision_info
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
 # Same kernel code as E1a/E1b/E2 -- imported, never copied.
 from eval_foveate import kernel_times, times_to_indices
@@ -429,8 +429,15 @@ def main() -> None:
                    else {})
     if chat_kwargs:
         print(f"chat template kwargs: {chat_kwargs}", flush=True)
+    # A timm vision tower (Perception-LM's) takes no attention switch from transformers and runs
+    # timm's own fused attention, so only its language model is set to sdpa. Every other
+    # answerer loads exactly as before.
+    vision_type = getattr(getattr(AutoConfig.from_pretrained(args.model, trust_remote_code=True),
+                                  "vision_config", None), "model_type", "")
+    attn = ({"text_config": "sdpa", "vision_config": "eager"} if vision_type == "timm_wrapper"
+            else "sdpa")
     model = AutoModelForImageTextToText.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+        args.model, torch_dtype=torch.bfloat16, attn_implementation=attn,
         device_map="cuda", trust_remote_code=True).eval()
 
     # the placebo pairs each item with another item's question text, fixed by seed
