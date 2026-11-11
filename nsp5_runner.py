@@ -49,7 +49,8 @@ TL = os.path.dirname(os.path.abspath(__file__))
 L = "logs/nsp5"
 R = os.environ.get("NSP5_RUNNER_DIR", f"{L}/runner")   # a second node runs its own plan here
 PLAN, STATUS, SKIP = f"{R}/plan.json", f"{R}/status.json", f"{R}/skip_gpus"
-MAX_MINE, SHARED_MINE = 6, 2
+MAX_MINE = int(os.environ.get("NSP5_MAX_MINE", "6"))   # lower it on a node with less host memory
+SHARED_MINE = 2
 FREE_MIN, SHARED_FREE, RESERVE, PER_EVAL = 40000, 60000, 30000, 30000   # MiB
 CPU_STAT = "/sys/fs/cgroup/cpu.stat"
 
@@ -253,6 +254,8 @@ def main() -> None:
     last_rss_log = 0.0
     last_cpu = (cpu_usec(), time.time())
     log(f"runner started, pid {os.getpid()}")
+    log(f"settings: MAX_MINE {MAX_MINE}, MAX_EXCLUSIVE {MAX_EXCLUSIVE}, MEM_LAUNCH {MEM_LAUNCH}, "
+        f"MEM_SHED {MEM_SHED}")
     while True:
         try:
             plan = json.load(open(PLAN))["arms"]

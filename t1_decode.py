@@ -41,7 +41,7 @@ ANET = "data/charades_full/anet_train_natural.json"
 OUT = "data/t1/frames"
 SHORT, LONG_CAP, QUALITY = 360, 640, 85
 
-EVAL_BENCHES = ("videomme", "lvb", "mlvu", "cgbench")   # loaded through bench.py
+EVAL_BENCHES = ("videomme", "lvb", "mlvu", "cgbench", "cgbench_cal")   # loaded through bench.py
 
 # Abort when this many videos have failed and none has succeeded (broken setup).
 FAIL_FAST = 20

@@ -202,7 +202,7 @@ def main() -> None:
     ap.add_argument("--name", required=True)
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--bench", default="lvbench",
-                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench"])
+                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench", "cgbench_cal"])
     args = ap.parse_args()
     from transformers import AutoModel, AutoProcessor
     out_dir = os.path.join("data/t1/priors", args.name)

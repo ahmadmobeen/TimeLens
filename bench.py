@@ -115,8 +115,16 @@ def load_cgbench(mini: bool = True) -> list[QItem]:
             for r in rows]
 
 
+def load_cgbench_cal() -> list[QItem]:
+    """CG-Bench's calibration split: the full release's questions on the 101 videos that no
+    question of the mini subset (the evaluation set) uses, 872 questions in all. It shares no
+    question and no video with any evaluation set and is used only to check the temperature fit."""
+    eval_vids = {q.vid for q in load_cgbench(mini=True)}
+    return [q for q in load_cgbench(mini=False) if q.vid not in eval_vids]
+
+
 LOADERS = {"lvbench": load_lvbench, "videomme": load_videomme, "lvb": load_lvb,
-           "mlvu": load_mlvu, "cgbench": load_cgbench}
+           "mlvu": load_mlvu, "cgbench": load_cgbench, "cgbench_cal": load_cgbench_cal}
 
 
 def load(bench: str) -> list[QItem]:
