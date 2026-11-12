@@ -38,6 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
+import time
 import zlib
 
 import torch
@@ -138,7 +139,7 @@ def times_to_indices_nearest(times: list[float], native_fps: float, total: int, 
 def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float, power: float = 3.0,
                 aks: tuple[float, float, int] = (0.8, -100.0, 5),
                 short_uniform: bool = False, seed: int = 0, candidates: int = 128,
-                stack: int = 4) -> list[float]:
+                stack: int = 4, nms_radius: float = 10.0, clip_len: int = 4) -> list[float]:
     """Frame times from a per-second score curve (second k covers [k, k+1)).
 
     topk   the n highest-scoring seconds. A video shorter than n seconds gets one frame per
@@ -203,6 +204,38 @@ def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float, power
                 prev = cdf[k - 1] if k > 0 else 0.0
                 out.append(min(dur - 1e-3, k + (q - prev) / p[k]))
         return out
+    if alloc in ("topk_nms", "keyclip"):
+        # NS-P5 Study X5. topk_nms: the highest-scoring seconds at least nms_radius s apart.
+        # keyclip: the highest peaks, each expanded to clip_len consecutive seconds (clips do not
+        # overlap), one frame per second. If too few seconds qualify, the rest go by score.
+        order = np.argsort(-z, kind="stable")
+        blocked = np.zeros(T, bool)
+        secs: list[int] = []
+        if alloc == "topk_nms":
+            r = max(1, int(np.ceil(nms_radius)))
+            for k in order:
+                if not blocked[k]:
+                    secs.append(int(k))
+                    blocked[max(0, k - r + 1):min(T, k + r)] = True
+                    if len(secs) == n:
+                        break
+        else:
+            c = max(1, int(clip_len))
+            for k in order:
+                lo = max(0, min(int(k) - c // 2, T - c))
+                hi = min(T, lo + c)
+                if blocked[lo:hi].any():
+                    continue
+                secs.extend(range(lo, hi))
+                blocked[lo:hi] = True
+                if len(secs) >= n:
+                    break
+        taken = set(secs[:n])
+        for k in order:
+            if len(taken) >= min(n, T):
+                break
+            taken.add(int(k))
+        return sorted(min(dur - 1e-3, k + 0.5) for k in taken)[:n]
     if alloc == "topk_stack":
         # NS-P5 Study T: top-k that may stack frames inside a second, as CaliFrame can: the
         # ceil(n / stack) highest-scoring seconds, `stack` frames evenly inside each.
@@ -405,10 +438,16 @@ def main() -> None:
     ap.add_argument("--qframe_candidates", type=int, default=128,
                     help="qframe: uniform candidate frames (Q-Frame's protocol: 128); 0 = every second")
     ap.add_argument("--alloc", choices=["topk", "kelly", "its", "aks", "qframe", "kelly_cap1",
-                                        "topk_stack"], default="kelly",
+                                        "topk_stack", "topk_nms", "keyclip"], default="kelly",
                     help="curve arm: how a curve becomes frame times (see curve_times); its = "
                          "BOLT's inverse transform sampling, aks = AKS's judge-and-split")
     ap.add_argument("--power", type=float, default=3.0, help="its: BOLT's exponent")
+    ap.add_argument("--nms_radius", type=float, default=10.0,
+                    help="topk_nms: chosen seconds lie at least this far apart (Study X5)")
+    ap.add_argument("--clip_len", type=int, default=4,
+                    help="keyclip: seconds in each clip around a peak (Study X5)")
+    ap.add_argument("--timing", action="store_true",
+                    help="add t_read and t_answer (seconds) to each row; use with --prefetch 0 (Study X1)")
     ap.add_argument("--stack", type=int, default=4,
                     help="topk_stack: frames placed inside each selected second (Study T)")
     ap.add_argument("--dose_k", type=int, default=-1,
@@ -651,7 +690,8 @@ def main() -> None:
                                 aks=(args.aks_t1, args.aks_t2, args.aks_depth),
                                 short_uniform=args.topk_short == "uniform",
                                 seed=zlib.crc32(f"{args.seed}:{key}".encode()),
-                                candidates=args.qframe_candidates, stack=args.stack)
+                                candidates=args.qframe_candidates, stack=args.stack,
+                                nms_radius=args.nms_radius, clip_len=args.clip_len)
         idx = (times_to_indices_nearest if args.refill == "nearest" else times_to_indices)(
             times, native_fps, total, n)
         # frames the budget refill supplied: times that fell on an already-taken source
@@ -704,6 +744,7 @@ def main() -> None:
         for j, item in enumerate(pending):
             key = item["rkey"]
             try:
+                t_read0 = time.perf_counter()
                 if pool:   # keep the next --prefetch reads in flight, consume them in order
                     while submitted < len(pending) and submitted <= j + args.prefetch:
                         ahead.append(pool.submit(read, pending[submitted]))
@@ -711,6 +752,7 @@ def main() -> None:
                     r = ahead.popleft().result()
                 else:
                     r = read(item)
+                t_read = time.perf_counter() - t_read0
                 center, prior_err, dur, idx = r["center"], r["prior_err"], r["dur"], r["idx"]
                 n_refill, native_fps = r["n_refill"], r["native_fps"]
                 frames, vmeta = r["frames"], r["vmeta"]
@@ -729,9 +771,15 @@ def main() -> None:
                 else:
                     inputs = processor(text=[text], images=None, videos=[(frames, vmeta)],
                                        padding=True, return_tensors="pt").to("cuda")
+                t_gen0 = time.perf_counter()
                 gen = model.generate(**inputs, do_sample=False, temperature=None,
                                      top_p=None, top_k=None, max_new_tokens=16,
                                      output_scores=True, return_dict_in_generate=True)
+                if args.timing:
+                    torch.cuda.synchronize()
+                timing_fields = ({"t_read": round(t_read, 4),
+                                  "t_answer": round(time.perf_counter() - t_gen0, 4)}
+                                 if args.timing else {})
                 out_ids = gen.sequences
                 reply = processor.batch_decode(
                     [out_ids[0][inputs.input_ids.shape[-1]:]], skip_special_tokens=True)[0]
@@ -766,7 +814,7 @@ def main() -> None:
                 "span": item["span"], "duration_s": dur, "n_frames": len(idx), "n_refill": n_refill,
                 "in_span": (sum(any(a - 0.5 <= i / native_fps <= b + 0.5 for a, b in item["spans"])
                                 for i in idx) if item["spans"] else None),
-                "p_letters": [round(p, 5) for p in p_letters]}) + "\n")
+                "p_letters": [round(p, 5) for p in p_letters], **timing_fields}) + "\n")
             out_fh.flush()
             if n_done % 50 == 0:
                 print(f"  [{n_done}/{len(items)}] acc {correct / n_done:.4f} "
