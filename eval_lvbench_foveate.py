@@ -204,6 +204,22 @@ def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float, power
                 prev = cdf[k - 1] if k > 0 else 0.0
                 out.append(min(dur - 1e-3, k + (q - prev) / p[k]))
         return out
+    if alloc == "waterfill":
+        # NS-P5 Study Y: whole frames n_t maximizing sum_t p_t log(1 + n_t) with sum_t n_t = n, the
+        # optimum under the measured log(1 + frames) relation (greedy on marginal gains, exact for
+        # this concave objective); the n_t frames of a second are spread evenly inside it.
+        import heapq
+        p = np.exp((z - z.max()) / tau)
+        p = (1 - eps) * p / p.sum() + eps / T
+        cnt = np.zeros(T, int)
+        heap = [(-float(pt) * np.log(2.0), t) for t, pt in enumerate(p)]
+        heapq.heapify(heap)
+        for _ in range(n):
+            _, t = heapq.heappop(heap)
+            cnt[t] += 1
+            heapq.heappush(heap, (-float(p[t]) * np.log((cnt[t] + 2) / (cnt[t] + 1)), t))
+        out = [float(t) + (j + 0.5) / cnt[t] for t in np.flatnonzero(cnt) for j in range(cnt[t])]
+        return sorted(min(dur - 1e-3, x) for x in out)
     if alloc in ("topk_nms", "keyclip"):
         # NS-P5 Study X5. topk_nms: the highest-scoring seconds at least nms_radius s apart.
         # keyclip: the highest peaks, each expanded to clip_len consecutive seconds (clips do not
@@ -438,7 +454,8 @@ def main() -> None:
     ap.add_argument("--qframe_candidates", type=int, default=128,
                     help="qframe: uniform candidate frames (Q-Frame's protocol: 128); 0 = every second")
     ap.add_argument("--alloc", choices=["topk", "kelly", "its", "aks", "qframe", "kelly_cap1",
-                                        "topk_stack", "topk_nms", "keyclip"], default="kelly",
+                                        "topk_stack", "topk_nms", "keyclip", "waterfill"],
+                    default="kelly",
                     help="curve arm: how a curve becomes frame times (see curve_times); its = "
                          "BOLT's inverse transform sampling, aks = AKS's judge-and-split")
     ap.add_argument("--power", type=float, default=3.0, help="its: BOLT's exponent")
