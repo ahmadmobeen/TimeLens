@@ -10,6 +10,7 @@ interval and a Holm-adjusted two-sided p-value across the budgets.
         n128_f2c_kelly_eps0:n128_f2c_topk:128
 
 An arm is named by its LVBench stem; on the other benchmarks its file is x1_<bench>_<stem>.
+--benches=lvbench,videomme pools only those benchmarks (Study R, METHODS-LOG 2026-11-12).
 """
 import sys
 
@@ -22,11 +23,16 @@ DRAWS, SEED = 5000, 0
 
 
 def main() -> None:
-    specs = [s.split(":") for s in sys.argv[1:]]
+    specs = [s.split(":") for s in sys.argv[1:] if not s.startswith("--")]
+    benches = BENCH
+    for arg in sys.argv[1:]:
+        if arg.startswith("--benches="):
+            benches = tuple(arg.split("=", 1)[1].split(","))
+            assert set(benches) <= set(BENCH), benches
     budgets = np.array([float(n) for _, _, n in specs])
     x = np.log2(budgets)
     per_bench = []                       # per benchmark: (video sums [n_budgets, n_videos], video counts)
-    for b in BENCH:
+    for b in benches:
         A = [load(path(a, b)) for a, _, _ in specs]
         B = [load(path(r, b)) for _, r, _ in specs]
         keys = sorted(set.intersection(*(set(t) for t in A + B)))
