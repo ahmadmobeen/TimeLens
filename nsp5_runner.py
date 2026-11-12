@@ -70,7 +70,9 @@ MEM_STAT, MEM_MAX = "/sys/fs/cgroup/memory.stat", "/sys/fs/cgroup/memory.max"
 # of GiB within a minute (qwen_vl_utils' torchvision fallback reads a whole video, 2026-11-11)
 MEM_LAUNCH = float(os.environ.get("NSP5_MEM_LAUNCH", "0.75"))
 MEM_SHED = float(os.environ.get("NSP5_MEM_SHED", "0.90"))
-SHED_MAX = 3
+# memory stops before a shard counts as an anomaly; a stop is a restart that resumes, so leaky evals
+# (CaliFrame runs grow to hundreds of GiB, 2026-11-12) can be allowed many
+SHED_MAX = int(os.environ.get("NSP5_SHED_MAX", "3"))
 MEM_POLL_S = 10                     # between rounds, host memory is read this often
 RETRIES, LOOP_S, RSS_LOG_S = 2, 60, 1800
 EMPTY_MIB = 4000                    # a GPU using less than this has nothing on it
