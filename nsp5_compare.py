@@ -41,7 +41,10 @@ def video_of(key: str) -> str:
         return key.split(">>>")[0]
     if key not in _VID:
         import bench
-        _VID.update({it.key: it.vid for it in bench.load(key.split(":", 1)[0])})
+        prefix = key.split(":", 1)[0]
+        # the full CG-Bench release holds every key of its subsets (mini, cal, fresh)
+        items = bench.load_cgbench(mini=False) if prefix == "cgbench" else bench.load(prefix)
+        _VID.update({it.key: it.vid for it in items})
     return _VID[key]
 
 

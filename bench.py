@@ -123,8 +123,21 @@ def load_cgbench_cal() -> list[QItem]:
     return [q for q in load_cgbench(mini=False) if q.vid not in eval_vids]
 
 
+def load_cgbench_fresh() -> list[QItem]:
+    """CG-Bench's fresh questions (NS-P5 Study S): the full release's questions on the evaluation
+    set's videos that the mini subset does not use, 8,256 in all. They share videos with the
+    evaluation set but no question, and no design decision or fit has used them. A full-release
+    question identical to a mini question (same video, stem and options) is left out."""
+    mini = load_cgbench(mini=True)
+    vids, keys = {q.vid for q in mini}, {q.key for q in mini}
+    same = {(q.vid, q.stem.strip(), q.options) for q in mini}
+    return [q for q in load_cgbench(mini=False)
+            if q.vid in vids and q.key not in keys and (q.vid, q.stem.strip(), q.options) not in same]
+
+
 LOADERS = {"lvbench": load_lvbench, "videomme": load_videomme, "lvb": load_lvb,
-           "mlvu": load_mlvu, "cgbench": load_cgbench, "cgbench_cal": load_cgbench_cal}
+           "mlvu": load_mlvu, "cgbench": load_cgbench, "cgbench_cal": load_cgbench_cal,
+           "cgbench_fresh": load_cgbench_fresh}
 
 
 def load(bench: str) -> list[QItem]:

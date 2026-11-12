@@ -202,7 +202,8 @@ def main() -> None:
     ap.add_argument("--name", required=True)
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--bench", default="lvbench",
-                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench", "cgbench_cal"])
+                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench", "cgbench_cal",
+                             "cgbench_fresh"])
     args = ap.parse_args()
     from transformers import AutoModel, AutoProcessor
     out_dir = os.path.join("data/t1/priors", args.name)
@@ -216,7 +217,9 @@ def main() -> None:
         model = AutoModel.from_pretrained(args.model, dtype=torch.float16).to("cuda").eval()
         scale = float(model.logit_scale.exp()) if hasattr(model, "logit_scale") else 100.0
         bias = float(model.logit_bias) if getattr(model, "logit_bias", None) is not None else 0.0
-    feats = encode_images(model, proc, out_dir, args.workers, args.model, args.bench)
+    # cgbench_fresh asks new questions about CG-Bench's evaluation videos: same frame features
+    img_bench = {"cgbench_fresh": "cgbench"}.get(args.bench, args.bench)
+    feats = encode_images(model, proc, out_dir, args.workers, args.model, img_bench)
 
     if args.bench == "lvbench":                  # the exact LVBench path, unchanged
         items = []

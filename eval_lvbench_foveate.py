@@ -137,7 +137,8 @@ def times_to_indices_nearest(times: list[float], native_fps: float, total: int, 
 
 def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float, power: float = 3.0,
                 aks: tuple[float, float, int] = (0.8, -100.0, 5),
-                short_uniform: bool = False, seed: int = 0, candidates: int = 128) -> list[float]:
+                short_uniform: bool = False, seed: int = 0, candidates: int = 128,
+                stack: int = 4) -> list[float]:
     """Frame times from a per-second score curve (second k covers [k, k+1)).
 
     topk   the n highest-scoring seconds. A video shorter than n seconds gets one frame per
@@ -202,6 +203,43 @@ def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float, power
                 prev = cdf[k - 1] if k > 0 else 0.0
                 out.append(min(dur - 1e-3, k + (q - prev) / p[k]))
         return out
+    if alloc == "topk_stack":
+        # NS-P5 Study T: top-k that may stack frames inside a second, as CaliFrame can: the
+        # ceil(n / stack) highest-scoring seconds, `stack` frames evenly inside each.
+        m = max(1, min(T, int(np.ceil(n / stack))))
+        c = int(np.ceil(n / m))
+        out = [float(k) + (j + 0.5) / c for k in sorted(np.argsort(-z, kind="stable")[:m])
+               for j in range(c)]
+        return sorted(min(dur - 1e-3, t) for t in out)[:n]
+    if alloc == "kelly_cap1" and T > n:
+        # NS-P5 Study T: CaliFrame's probability with at most one frame per second. Water-filling
+        # with capacity one, q_t = min(1, lam p_t) with sum q = n; seconds with q_t = 1 take a
+        # frame, the rest are placed at the quantiles of the remaining mass (q_t < 1, so at most
+        # one frame lands in a second). Videos with no more seconds than n fall through to kelly.
+        p = np.exp((z - z.max()) / tau)
+        p = (1 - eps) * p / p.sum() + eps / T
+        lo_l, hi_l = np.log(n), np.log(n / p.min() + 1.0)
+        for _ in range(200):
+            mid = (lo_l + hi_l) / 2
+            if np.minimum(1.0, np.exp(mid) * p).sum() < n:
+                lo_l = mid
+            else:
+                hi_l = mid
+        q = np.minimum(1.0, np.exp(hi_l) * p)
+        full = np.flatnonzero(q >= 1.0 - 1e-9)
+        rest = q.copy()
+        rest[full] = 0.0
+        m = n - len(full)
+        picks = set(int(k) for k in full)
+        if m > 0 and rest.sum() > 0:
+            cdf = np.cumsum(rest)
+            for i in range(m):
+                picks.add(min(int(np.searchsorted(cdf, (i + 0.5) * cdf[-1] / m)), T - 1))
+        for k in np.argsort(-p, kind="stable"):    # rounding left a gap: next most probable
+            if len(picks) >= n:
+                break
+            picks.add(int(k))
+        return sorted(float(k) + 0.5 for k in picks)[:n]
     p = np.exp((z - z.max()) / tau)
     p = (1 - eps) * p / p.sum() + eps / T
     cdf = np.cumsum(p)
@@ -212,6 +250,35 @@ def curve_times(z, dur: float, n: int, alloc: str, tau: float, eps: float, power
         prev = cdf[k - 1] if k > 0 else 0.0
         out.append(min(dur - 1e-3, k + (q - prev) / p[k]))
     return out
+
+
+def dose_times(spans, dur: float, n: int, k: int, margin: float = 30.0) -> list[float]:
+    """NS-P5 Study V: exactly k frames inside the annotated evidence, spread evenly over the evidence
+    seconds (several spans are treated as one), and the other n - k spread evenly over the video
+    away from the evidence by at least `margin` seconds (the margin shrinks if nothing is left)."""
+    import numpy as np
+    from t1_data import span_seconds
+    T = max(1, int(np.ceil(dur)))
+    inside = np.zeros(T, bool)
+    for a, b in spans:
+        lo, hi = span_seconds(a, b, T)
+        inside[lo:hi] = True
+    if not inside.any():
+        raise ValueError("dose arm: question without evidence seconds")
+    def spread(mask: np.ndarray, m: int) -> list[float]:
+        secs = np.flatnonzero(mask)
+        return [float(secs[min(int((i + 0.5) * len(secs) / m), len(secs) - 1)])
+                + ((i + 0.5) * len(secs) / m) % 1.0 for i in range(m)]
+    out = spread(inside, k) if k > 0 else []
+    for mg in (margin, margin / 2, 0.0):
+        away = ~inside
+        for s in np.flatnonzero(inside):
+            away[max(0, s - int(mg)):min(T, s + int(mg) + 1)] = False
+        if away.sum() > 0:
+            break
+    if n - k > 0:
+        out += spread(away, n - k) if away.any() else spread(np.ones(T, bool), n - k)
+    return sorted(min(dur - 1e-3, t) for t in out)
 
 
 @torch.no_grad()
@@ -337,10 +404,17 @@ def main() -> None:
                          "'lvbench:<key>>>><uid>' (t1_train.py eval_lvbench writes them)")
     ap.add_argument("--qframe_candidates", type=int, default=128,
                     help="qframe: uniform candidate frames (Q-Frame's protocol: 128); 0 = every second")
-    ap.add_argument("--alloc", choices=["topk", "kelly", "its", "aks", "qframe"], default="kelly",
+    ap.add_argument("--alloc", choices=["topk", "kelly", "its", "aks", "qframe", "kelly_cap1",
+                                        "topk_stack"], default="kelly",
                     help="curve arm: how a curve becomes frame times (see curve_times); its = "
                          "BOLT's inverse transform sampling, aks = AKS's judge-and-split")
     ap.add_argument("--power", type=float, default=3.0, help="its: BOLT's exponent")
+    ap.add_argument("--stack", type=int, default=4,
+                    help="topk_stack: frames placed inside each selected second (Study T)")
+    ap.add_argument("--dose_k", type=int, default=-1,
+                    help="--arm dose: frames placed inside the annotated evidence (Study V)")
+    ap.add_argument("--dose_margin", type=float, default=30.0,
+                    help="--arm dose: the other frames stay this many seconds away from the evidence")
     ap.add_argument("--aks_t1", type=float, default=0.8, help="aks: split threshold (released default)")
     ap.add_argument("--aks_t2", type=float, default=-100.0, help="aks: std threshold (released default)")
     ap.add_argument("--aks_depth", type=int, default=5, help="aks: maximum depth (released default)")
@@ -356,7 +430,7 @@ def main() -> None:
                     help="curve arm PLACEBO: allocate with ANOTHER question's curve from the "
                          "SAME video -- same video, same allocator, wrong question")
     ap.add_argument("--bench", default="lvbench",
-                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench"],
+                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench", "cgbench_fresh"],
                     help="question set; non-LVBench sets come through bench.py")
     ap.add_argument("--seed", type=int, default=0,
                     help="fixes the --shuffle_query rotation")
@@ -560,7 +634,7 @@ def main() -> None:
         else:
             center = min(max(item["center"], 0.0), dur)
             prior_err = None
-        if args.arm in ("uniform", "topk_siglip", "curve"):
+        if args.arm in ("uniform", "topk_siglip", "curve", "dose"):
             # topk_siglip only needs n and the frame grid here; the actual
             # indices are replaced by the SigLIP selection below.
             times = kernel_times("uniform", center, dur, n)
@@ -569,13 +643,15 @@ def main() -> None:
                                  offpeak_shift=args.offpeak_shift)
         if args.arm.startswith("offpeak"):
             realized.append(abs(min(dur, center + args.offpeak_shift) - center))
+        if args.arm == "dose":
+            times = dose_times(item["spans"], dur, n, args.dose_k, args.dose_margin)
         if args.arm == "curve":
             times = curve_times(curves[curve_of[key]], dur, n, args.alloc,
                                 args.tau, args.eps, power=args.power,
                                 aks=(args.aks_t1, args.aks_t2, args.aks_depth),
                                 short_uniform=args.topk_short == "uniform",
                                 seed=zlib.crc32(f"{args.seed}:{key}".encode()),
-                                candidates=args.qframe_candidates)
+                                candidates=args.qframe_candidates, stack=args.stack)
         idx = (times_to_indices_nearest if args.refill == "nearest" else times_to_indices)(
             times, native_fps, total, n)
         # frames the budget refill supplied: times that fell on an already-taken source

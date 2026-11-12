@@ -67,7 +67,8 @@ def run_concat(bench: str, tag: str) -> dict[str, np.ndarray]:
     from prior_encode import (QUERY_INSTRUCTION, load_qwen3_emb, qwen3_conversation, qwen3_embed,
                               qwen3_inputs)
     qs = questions(bench)
-    img = np.load(os.path.join(PRIORS, "qwen3vl_emb_8b", f"{bench}_img.npz"))
+    img_bench = {"cgbench_fresh": "cgbench"}.get(bench, bench)   # same videos as CG-Bench
+    img = np.load(os.path.join(PRIORS, "qwen3vl_emb_8b", f"{img_bench}_img.npz"))
     have = set(img.files)
     model, proc = load_qwen3_emb("Qwen/Qwen3-VL-Embedding-8B")
     curves, frames = {}, {}
@@ -161,7 +162,8 @@ def main() -> None:
     ap.add_argument("--curves", default="", help="tau: the LVBench curves .npz")
     ap.add_argument("--out", default="", help="tau: where to write the json")
     ap.add_argument("--bench", default="lvbench",
-                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench", "cgbench_cal"])
+                    choices=["lvbench", "videomme", "lvb", "mlvu", "cgbench", "cgbench_cal",
+                             "cgbench_fresh"])
     ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
     tag = "" if args.bench == "lvbench" else f"{args.bench}_"
