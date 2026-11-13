@@ -41,10 +41,30 @@ import re
 import time
 import zlib
 
+import qwen_vl_utils.vision_process as _qwen_vision
 import torch
 from decord import VideoReader
 from qwen_vl_utils import process_vision_info
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
+
+_torchvision_read = _qwen_vision.VIDEO_READER_BACKENDS["torchvision"]
+
+
+def _torchvision_read_one_cpu(ele: dict):
+    """qwen_vl_utils falls back to torchvision when decord fails on a video, and torchvision decodes
+    the whole video. FFmpeg's scaler then starts one worker thread per visible CPU (224 here) for
+    every scaling graph; on 2026-11-13 such readers filled the container's task limit and nothing
+    in it could fork. With one visible CPU the scaler starts no workers. The affinity applies to
+    the calling thread only and is restored after the read; the frames are the same."""
+    old = os.sched_getaffinity(0)
+    os.sched_setaffinity(0, {min(old)})
+    try:
+        return _torchvision_read(ele)
+    finally:
+        os.sched_setaffinity(0, old)
+
+
+_qwen_vision.VIDEO_READER_BACKENDS["torchvision"] = _torchvision_read_one_cpu
 
 # Same kernel code as E1a/E1b/E2 -- imported, never copied.
 from eval_foveate import kernel_times, times_to_indices
