@@ -3,6 +3,7 @@ arms are merged: paired differences in plain accuracy with 95% intervals from th
 resamples videos within each benchmark, 5,000 draws, seed 0 (nsp5_pooled.pooled).
 
     .venv/bin/python nsp5_wave1_score.py S     fresh CG-Bench questions: S1 M2 - GMM-EVA's selection, S2 M2 - uniform
+    .venv/bin/python nsp5_wave1_score.py S128  the same at 128 frames: S3, and S4 (128 minus 64 per question)
     .venv/bin/python nsp5_wave1_score.py T     stacking, LVBench + CG-Bench at 64 and 128 frames: T1-T3
     .venv/bin/python nsp5_wave1_score.py U     scorer x query x rule on the five benchmarks: U1-U3, Shapley split
 """
@@ -49,6 +50,24 @@ def study_s() -> None:
     show("S2", "q8_kelly_eps0", "uniform", fresh)
 
 
+def study_s128() -> None:
+    """Study S part 2 (registered 2026-11-13): S3 at 128 frames, and S4, the per-question difference
+    at 128 frames minus that at 64 on the same new questions, videos resampled (5,000 draws, seed 0)."""
+    import numpy as np
+    from nsp5_compare import video_of
+    fresh = ("cgbench_fresh",)
+    show("S3 (primary, 128 frames)", "n128_q8_kelly_eps0", "n128_f2c_topk", fresh)
+    arms = [load(path(a, "cgbench_fresh")) for a in
+            ("n128_q8_kelly_eps0", "n128_f2c_topk", "q8_kelly_eps0", "f2c_topk_nr")]
+    keys = sorted(set.intersection(*(set(a) for a in arms)))
+    d = np.array([(arms[0][k] - arms[1][k]) - (arms[2][k] - arms[3][k]) for k in keys])
+    _, inv = np.unique([video_of(k) for k in keys], return_inverse=True)
+    sums, cnts = np.bincount(inv, weights=d), np.bincount(inv).astype(float)
+    idx = np.random.default_rng(0).integers(0, len(sums), size=(5000, len(sums)))
+    lo, hi = np.percentile(sums[idx].sum(1) / cnts[idx].sum(1), [2.5, 97.5])
+    print(f"S4 (128 minus 64 frames): {100 * d.mean():+.2f} [{100 * lo:+.2f}, {100 * hi:+.2f}] (n={len(keys)})")
+
+
 def study_t() -> None:
     arms = {64: ("q8_kelly_eps0", "t_cap1", "q8opt_topk_nr", "t_stack4"),
             128: ("n128_q8_kelly_eps0", "n128_t_cap1", "n128_q8opt_topk", "n128_t_stack4")}
@@ -93,4 +112,4 @@ def study_u() -> None:
 
 
 if __name__ == "__main__":
-    {"S": study_s, "T": study_t, "U": study_u}[sys.argv[1]]()
+    {"S": study_s, "S128": study_s128, "T": study_t, "U": study_u}[sys.argv[1]]()
