@@ -66,6 +66,49 @@ def _torchvision_read_one_cpu(ele: dict):
 
 _qwen_vision.VIDEO_READER_BACKENDS["torchvision"] = _torchvision_read_one_cpu
 
+# For videos where decord cannot reach the last frames, the reference read above decodes the whole
+# video with torchvision on every visit (hundreds of GiB for an hour of video). The harness uses
+# only the reference tensor's shape and dtype and the frame rate and frame count, so after such a
+# read these are kept on disk, keyed by the read's settings, and later visits reuse them. The values
+# are those the read returned, so every output is unchanged.
+REF_CACHE = "data/t1/refmeta"
+
+
+def _ref_cache_path(ref_video: dict) -> str:
+    import hashlib
+    key = json.dumps({k: ref_video[k] for k in sorted(ref_video)}, sort_keys=True)
+    return os.path.join(REF_CACHE, hashlib.sha1(key.encode()).hexdigest() + ".json")
+
+
+def ref_cache_get(ref_video: dict):
+    """(tensor with the cached shape and dtype on the meta device, metadata) or None."""
+    path = _ref_cache_path(ref_video)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        c = json.load(fh)
+    if c.get("video") != ref_video["video"]:
+        return None
+    dtype = getattr(torch, c["dtype"].split(".")[-1])
+    meta = {"fps": c["fps"], "total_num_frames": c["total_num_frames"], "video_backend": c["video_backend"]}
+    return torch.empty(c["shape"], dtype=dtype, device="meta"), meta
+
+
+def ref_cache_put(ref_video: dict, ref: tuple) -> None:
+    """Keep a torchvision-fallback read (the expensive one); decord reads are cheap to repeat."""
+    tensor, meta = ref
+    if meta.get("video_backend") != "torchvision":
+        return
+    os.makedirs(REF_CACHE, exist_ok=True)
+    path = _ref_cache_path(ref_video)
+    entry = {"video": ref_video["video"], "settings": {k: v for k, v in ref_video.items() if k != "video"},
+             "shape": list(tensor.shape), "dtype": str(tensor.dtype), "fps": float(meta["fps"]),
+             "total_num_frames": int(meta["total_num_frames"]), "video_backend": meta["video_backend"]}
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(entry, fh)
+    os.replace(tmp, path)
+
 # Same kernel code as E1a/E1b/E2 -- imported, never copied.
 from eval_foveate import kernel_times, times_to_indices
 
@@ -693,7 +736,13 @@ def main() -> None:
             if args.max_pixels:
                 ref_video["max_pixels"] = args.max_pixels
             ref_msgs = [{"role": "user", "content": [ref_video, {"type": "text", "text": "x"}]}]
-            _, ref_videos = process_vision_info(ref_msgs, return_video_metadata=True)
+            cached = ref_cache_get(ref_video) if args.center != "prior" else None
+            if cached is not None:
+                ref_videos = [cached]
+            else:
+                _, ref_videos = process_vision_info(ref_msgs, return_video_metadata=True)
+                if args.center != "prior":
+                    ref_cache_put(ref_video, ref_videos[0])
             ref_memo.clear()
             ref_memo[item["video_path"]] = ref_videos[0]
         ref_tensor, meta = ref_memo[item["video_path"]]
