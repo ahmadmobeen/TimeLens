@@ -116,13 +116,96 @@ def warm_one(args: tuple) -> tuple:
     return path, len(todo), ""
 
 
+SCAN = os.path.join("logs", "nsp5", "cal", "decord_scan.json")
+SCAN_BENCHES = ("lvbench", "videomme", "lvb", "mlvu", "cgbench", "cgbench_cal")   # cgbench_fresh = cgbench's videos
+
+
+def decord_fails(path: str) -> tuple:
+    """qwen_vl_utils' own decord read (16 frames, always including the last frame, as every
+    reference read does); a failure here is what sends the eval to the whole-video fallback."""
+    try:
+        vp.VIDEO_READER_BACKENDS["decord"]({"type": "video", "video": path, "nframes": 16})
+        return path, False, ""
+    except Exception as ex:                                    # report the reason with the video
+        return path, True, repr(ex)[:160]
+
+
 def failing_videos() -> set:
-    """Every video whose decord read failed in any eval log."""
+    """Every video whose decord read failed in any eval log, plus every failure of the last scan."""
     out = set()
     pat = re.compile(r"video_reader_backend decord error.*?\[(/[^\]]+\.(?:mp4|mkv|webm|avi|mov))\]")
     for f in glob.glob("logs/nsp5/*.log"):
         out.update(pat.findall(open(f, errors="ignore").read()))
+    if os.path.exists(SCAN):
+        out.update(v for v, r in json.load(open(SCAN)).items() if r["fails"])
     return out
+
+
+def decord_one(args: tuple) -> tuple:
+    """Cache entries for a video decord reads, from decord's own frame count, frame rate and frame
+    size: the values qwen_vl_utils' decord reference read returns (its tensor is resized the same way).
+    Decord's failures are load-dependent, and on the 840 videos where the fallback ran, decord's count
+    and rate equal torchvision's on 839 (one frame apart on the last), so caching every video removes
+    the fallback without changing any reference."""
+    import decord
+    path, settings_list = args
+    todo = [s for s in settings_list if not os.path.exists(ev._ref_cache_path(ref_video(path, s)))]
+    if not todo:
+        return path, 0, ""
+    try:
+        vr = decord.VideoReader(path)                      # builds the index; decodes no frame
+        with av.open(path, metadata_errors="ignore") as c:  # frame size from the stream header
+            cc = c.streams.video[0].codec_context
+            h, w = cc.height, cc.width
+        read = (len(vr), float(vr.get_avg_fps()), int(h), int(w))
+    except Exception as ex:
+        return path, 0, repr(ex)[:160]
+    for s in todo:
+        rv = ref_video(path, s)
+        e = entry_for(path, {k: v for k, v in rv.items() if k not in ("type", "video")}, read)
+        entry = {"video": path, "settings": {k: v for k, v in rv.items() if k != "video"},
+                 "shape": e["shape"], "dtype": e["dtype"], "fps": e["fps"],
+                 "total_num_frames": e["total_num_frames"], "video_backend": "decord"}
+        p = ev._ref_cache_path(rv)
+        tmp = f"{p}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(entry, fh)
+        os.replace(tmp, p)
+    return path, len(todo), ""
+
+
+def warm_all(workers: int) -> None:
+    """Every video of the benchmarks, every planned setting, from decord's metadata (fallback videos
+    keep their torchvision entries, which are written first)."""
+    import bench
+    settings = planned_settings()
+    videos = sorted({q.video_path for b in SCAN_BENCHES for q in bench.load(b)})
+    written, errors = 0, []
+    with Pool(workers) as pool:
+        for path, n, err in pool.imap_unordered(decord_one, [(v, settings) for v in videos]):
+            written += n
+            if err:
+                errors.append((path, err))
+    print(f"{len(videos)} videos x {len(settings)} settings: wrote {written} entries; {len(errors)} errors", flush=True)
+    for path, err in errors[:10]:
+        print("  ERROR", path, err, flush=True)
+
+
+def scan(workers: int) -> None:
+    """Test every video of the benchmarks once, so the cache can be filled before an eval meets one."""
+    import bench
+    videos = sorted({q.video_path for b in SCAN_BENCHES for q in bench.load(b)})
+    done = json.load(open(SCAN)) if os.path.exists(SCAN) else {}
+    todo = [v for v in videos if v not in done]
+    print(f"{len(videos)} videos, {len(todo)} not scanned yet", flush=True)
+    with Pool(workers) as pool:
+        for i, (path, fails, why) in enumerate(pool.imap_unordered(decord_fails, todo), 1):
+            done[path] = {"fails": fails, "why": why}
+            if i % 200 == 0:
+                json.dump(done, open(SCAN, "w"))
+                print(f"  {i}/{len(todo)} scanned, {sum(r['fails'] for r in done.values())} fail", flush=True)
+    json.dump(done, open(SCAN, "w"))
+    print(f"scan done: {sum(r['fails'] for r in done.values())} of {len(done)} videos fail decord", flush=True)
 
 
 def planned_settings() -> list:
@@ -144,7 +227,7 @@ def planned_settings() -> list:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=["check", "warm"])
+    ap.add_argument("what", choices=["check", "warm", "scan", "all"])
     ap.add_argument("--mode", choices=["packets", "decode"], default="decode")
     ap.add_argument("--workers", type=int, default=8)
     a = ap.parse_args()
@@ -157,6 +240,12 @@ def main() -> None:
         for f, _, msg in bad[:10]:
             print("  MISMATCH", f, msg)
         sys.exit(1 if bad else 0)
+    if a.what == "scan":
+        scan(a.workers)
+        return
+    if a.what == "all":
+        warm_all(a.workers)
+        return
     settings = planned_settings()
     videos = sorted(failing_videos())
     print(f"{len(videos)} videos with a decord failure; settings: {settings}", flush=True)
