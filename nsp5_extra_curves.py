@@ -110,13 +110,14 @@ def run_blip(bench: str, tag: str, workers: int) -> dict[str, np.ndarray]:
     # but the checkpoint's text vocabulary keeps both rows (30524).
     assert model.config.text_config.vocab_size == 30524, model.config.text_config.vocab_size
     enc = 30523
+    fb = {"cgbench_fresh": "cgbench"}.get(bench, bench)   # same videos, so CG-Bench's cached frames
     vids = []
     for v in sorted(by_vid):
-        meta = os.path.join(FRAMES, bench, v + ".json")
+        meta = os.path.join(FRAMES, fb, v + ".json")
         if os.path.exists(meta):
             with open(meta, encoding="utf-8") as fh:
                 vids.append((v, len(json.load(fh)["t"])))
-    loader = DataLoader(Chunks(vids, proc.image_processor, "", chunk=CHUNK, bench=bench),
+    loader = DataLoader(Chunks(vids, proc.image_processor, "", chunk=CHUNK, bench=fb),
                         batch_size=None, num_workers=workers, prefetch_factor=2)
     curves, cur, parts = {}, None, []
 
