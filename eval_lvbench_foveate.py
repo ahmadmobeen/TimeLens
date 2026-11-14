@@ -740,7 +740,17 @@ def main() -> None:
             if cached is not None:
                 ref_videos = [cached]
             else:
-                _, ref_videos = process_vision_info(ref_msgs, return_video_metadata=True)
+                try:
+                    _, ref_videos = process_vision_info(ref_msgs, return_video_metadata=True)
+                except ValueError as ex:
+                    # "Up to N frames": a video with fewer frames than --n_frames is read whole,
+                    # rounded down to qwen_vl_utils' frame factor of 2. Only this error path
+                    # changes; every read that succeeded before is untouched.
+                    m = re.fullmatch(r"nframes should in interval \[(\d+), (\d+)\], but got (\d+)\.", str(ex))
+                    if not m or int(m.group(3)) <= int(m.group(2)):
+                        raise
+                    ref_video["nframes"] = int(m.group(2)) // 2 * 2
+                    _, ref_videos = process_vision_info(ref_msgs, return_video_metadata=True)
                 if args.center != "prior":
                     ref_cache_put(ref_video, ref_videos[0])
             ref_memo.clear()
