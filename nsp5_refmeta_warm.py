@@ -110,7 +110,10 @@ def warm_one(args: tuple) -> tuple:
         return path, 0, repr(ex)
     for s in todo:
         rv = ref_video(path, s)
-        e = entry_for(path, {k: v for k, v in rv.items() if k not in ("type", "video")}, read)
+        try:
+            e = entry_for(path, {k: v for k, v in rv.items() if k not in ("type", "video")}, read)
+        except ValueError:          # an impossible setting for this video: the real read raises too
+            continue
         meta = {"fps": e["fps"], "total_num_frames": e["total_num_frames"], "video_backend": "torchvision"}
         ev.ref_cache_put(rv, (torch.empty(e["shape"], dtype=torch.float32, device="meta"), meta))
     return path, len(todo), ""
@@ -162,7 +165,10 @@ def decord_one(args: tuple) -> tuple:
         return path, 0, repr(ex)[:160]
     for s in todo:
         rv = ref_video(path, s)
-        e = entry_for(path, {k: v for k, v in rv.items() if k not in ("type", "video")}, read)
+        try:
+            e = entry_for(path, {k: v for k, v in rv.items() if k not in ("type", "video")}, read)
+        except ValueError:          # e.g. 256 frames from a 240-frame clip: the real read raises too
+            continue
         entry = {"video": path, "settings": {k: v for k, v in rv.items() if k != "video"},
                  "shape": e["shape"], "dtype": e["dtype"], "fps": e["fps"],
                  "total_num_frames": e["total_num_frames"], "video_backend": "decord"}
