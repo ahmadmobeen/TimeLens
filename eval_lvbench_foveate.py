@@ -530,6 +530,17 @@ def main() -> None:
                     help="add t_read and t_answer (seconds) to each row; use with --prefetch 0 (Study X1)")
     ap.add_argument("--stack", type=int, default=4,
                     help="topk_stack: frames placed inside each selected second (Study T)")
+    ap.add_argument("--input", choices=["video", "images"], default="video",
+                    help="answer-model input: the frames as one video (default), or as separate "
+                         "images, each after its time as text, which lets each frame have its own "
+                         "resolution (Study AA)")
+    ap.add_argument("--res_alloc", choices=["none", "gmm"], default="none",
+                    help="--input images: visual tokens per frame, equal shares of the budget "
+                         "(none) or GMM-EVA's primary and secondary tiers on this arm's own score "
+                         "curve (gmm; nsp5_gmm_eva.py, needs <curves>_gmm.npz)")
+    ap.add_argument("--res_ratio", type=float, default=4.0,
+                    help="--res_alloc gmm: tokens of a primary frame over a secondary one "
+                         "(GMM-EVA's 256 : 64)")
     ap.add_argument("--dose_k", type=int, default=-1,
                     help="--arm dose: frames placed inside the annotated evidence (Study V)")
     ap.add_argument("--dose_margin", type=float, default=30.0,
@@ -660,10 +671,14 @@ def main() -> None:
             scoring_text[it["key"] + it["uid"]] = qs[(i + rot) % len(qs)]
         print(f"PLACEBO: scoring with another question's text (rotation {rot})", flush=True)
 
-    curves, curve_of = None, {}
+    if args.res_alloc != "none" and (args.input != "images" or args.arm != "curve"):
+        raise SystemExit("--res_alloc needs --input images and --arm curve")
+    curves, curve_of, gmm = None, {}, None
     if args.arm == "curve":
         import numpy as np
         curves = np.load(args.curves)
+        if args.res_alloc == "gmm":                 # GMM-EVA's mixtures, one per question curve
+            gmm = np.load(args.curves[:-len(".npz")] + "_gmm.npz")
         by_video: dict[str, list[str]] = {}
         qkey_of = {it["rkey"]: it["qkey"] for it in items}
         for it in items:
@@ -823,6 +838,34 @@ def main() -> None:
             idx = sorted({scan[i] for i in best})
 
         frames = torch.from_numpy(vr.get_batch(idx).asnumpy()).permute(0, 3, 1, 2)
+        if args.input == "images":
+            # Study AA: each frame becomes its own image with its own share of the same visual-token
+            # budget: equal shares, or GMM-EVA's tiers (a primary frame per event gets res_ratio
+            # times the tokens of a secondary one) on this arm's own score curve.
+            import numpy as np
+            import nsp5_gmm_eva as gmm_eva
+            from PIL import Image
+            budget = (args.total_pixels or 14336 * 28 * 28) / (28 * 28)
+            ftimes = [i / native_fps for i in idx]
+            if args.res_alloc == "gmm":
+                ck = curve_of[key]
+                tier = gmm_eva.tiers(ftimes, curves[ck], gmm[ck])
+                shares = gmm_eva.token_shares(tier, budget, args.res_ratio)
+            else:
+                tier = np.zeros(len(idx), int)
+                shares = gmm_eva.token_shares(tier, budget, 1.0)
+            H0, W0 = int(frames.shape[2]), int(frames.shape[3])
+            images = []
+            for f, tok in zip(frames, shares):
+                h, w = _qwen_vision.smart_resize(H0, W0, factor=28, min_pixels=4 * 28 * 28,
+                                                 max_pixels=max(int(tok * 28 * 28), 4 * 28 * 28))
+                img = torch.nn.functional.interpolate(f[None].float(), size=(h, w), mode="bicubic",
+                                                      align_corners=False, antialias=True)
+                images.append(Image.fromarray(img.clamp(0, 255).to(torch.uint8)[0]
+                                              .permute(1, 2, 0).numpy()))
+            return {"center": center, "prior_err": prior_err, "dur": dur, "idx": idx,
+                    "n_refill": n_refill, "native_fps": native_fps, "frames": None, "vmeta": None,
+                    "images": images, "ftimes": ftimes, "n_primary": int(tier.sum())}
         frames = torch.nn.functional.interpolate(
             frames.float(), size=(H, W), mode="bicubic",
             align_corners=False, antialias=True).clamp(0, 255).to(ref_tensor.dtype)
@@ -854,13 +897,33 @@ def main() -> None:
                 frames, vmeta = r["frames"], r["vmeta"]
 
                 # 3) Ask the multiple-choice question over exactly those frames.
-                messages = [{"role": "user", "content": [
-                    {"type": "video", "video": item["video_path"]},
-                    {"type": "text", "text": PROMPT.format(item["question"],
-                                                          letter_list(item["n_opts"]))}]}]
-                text = processor.apply_chat_template(messages, tokenize=False,
-                                                     add_generation_prompt=True, **chat_kwargs)
-                if new_video_api:
+                image_fields = {}
+                if args.input == "images":       # Study AA: each image after its time as text
+                    content = []
+                    for t_s in r["ftimes"]:
+                        content += [{"type": "text", "text": f"{int(t_s // 60)}:{int(t_s % 60):02d}"},
+                                    {"type": "image"}]
+                    content.append({"type": "text", "text": PROMPT.format(
+                        item["question"], letter_list(item["n_opts"]))})
+                    text = processor.apply_chat_template([{"role": "user", "content": content}],
+                                                         tokenize=False, add_generation_prompt=True,
+                                                         **chat_kwargs)
+                    inputs = processor(text=[text], images=r["images"], videos=None, padding=True,
+                                       return_tensors="pt").to("cuda")
+                    image_fields = {"input": "images", "res_alloc": args.res_alloc,
+                                    "n_primary": r["n_primary"],
+                                    "visual_tokens": int(inputs["image_grid_thw"].prod(-1).sum()) // 4}
+                    messages = None
+                else:
+                    messages = [{"role": "user", "content": [
+                        {"type": "video", "video": item["video_path"]},
+                        {"type": "text", "text": PROMPT.format(item["question"],
+                                                              letter_list(item["n_opts"]))}]}]
+                    text = processor.apply_chat_template(messages, tokenize=False,
+                                                         add_generation_prompt=True, **chat_kwargs)
+                if messages is None:
+                    pass
+                elif new_video_api:
                     inputs = processor(text=[text], images=None, videos=[frames],
                                        video_metadata=[vmeta], do_sample_frames=False,
                                        padding=True, return_tensors="pt").to("cuda")
@@ -910,7 +973,8 @@ def main() -> None:
                 "span": item["span"], "duration_s": dur, "n_frames": len(idx), "n_refill": n_refill,
                 "in_span": (sum(any(a - 0.5 <= i / native_fps <= b + 0.5 for a, b in item["spans"])
                                 for i in idx) if item["spans"] else None),
-                "p_letters": [round(p, 5) for p in p_letters], **timing_fields}) + "\n")
+                "p_letters": [round(p, 5) for p in p_letters], **timing_fields,
+                **image_fields}) + "\n")
             out_fh.flush()
             if n_done % 50 == 0:
                 print(f"  [{n_done}/{len(items)}] acc {correct / n_done:.4f} "
