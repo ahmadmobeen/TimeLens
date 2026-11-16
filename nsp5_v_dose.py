@@ -20,8 +20,16 @@ out is reported.
     env -u VIRTUAL_ENV OMP_NUM_THREADS=8 .venv/bin/python -u nsp5_v_dose.py
 
 writes logs/nsp5/analysis/v_dose.json and prints the summary.
+
+    ... nsp5_v_dose.py ext
+
+scores the registered extension (METHODS-LOG 2026-11-16, 43aa42b1): CG-Bench at all seven doses
+(x1_cgbench_v_dose{2,8,32} added) on its seven-dose population, VE1 = V1 there, and 32 minus 16 as a
+descriptive contrast; writes logs/nsp5/analysis/v_dose_ext.json and leaves v_dose.json as registered.
 """
 from __future__ import annotations
+
+import sys
 
 import numpy as np
 
@@ -82,6 +90,12 @@ def dose_contrasts(data: dict, bench: str, boots: dict) -> dict:
 
 
 def main() -> None:
+    out = "v_dose.json"
+    if sys.argv[1:] == ["ext"]:
+        global CONTRASTS
+        DOSES["cgbench"] = DOSES["lvbench"]
+        CONTRASTS = CONTRASTS + ((32, 16),)
+        out = "v_dose_ext.json"
     data, census = build()
     print("population:", census, flush=True)
     boots = W.make_boots({b: [v for v, bb in zip(data["vid"], data["bench"]) if bb == b]
@@ -106,7 +120,7 @@ def main() -> None:
                       "threshold fits best" if all(threshold_best.values()) else
                       f"per benchmark: {holds}")
     print("Reading:", res["reading"])
-    print("wrote", W.write_json("v_dose.json", res))
+    print("wrote", W.write_json(out, res))
 
 
 if __name__ == "__main__":
