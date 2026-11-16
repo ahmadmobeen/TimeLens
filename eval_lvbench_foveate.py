@@ -517,10 +517,11 @@ def main() -> None:
     ap.add_argument("--qframe_candidates", type=int, default=128,
                     help="qframe: uniform candidate frames (Q-Frame's protocol: 128); 0 = every second")
     ap.add_argument("--alloc", choices=["topk", "kelly", "its", "aks", "qframe", "kelly_cap1",
-                                        "topk_stack", "topk_nms", "keyclip", "waterfill"],
+                                        "topk_stack", "topk_nms", "keyclip", "waterfill", "f2c"],
                     default="kelly",
                     help="curve arm: how a curve becomes frame times (see curve_times); its = "
-                         "BOLT's inverse transform sampling, aks = AKS's judge-and-split")
+                         "BOLT's inverse transform sampling, aks = AKS's judge-and-split, f2c = "
+                         "F2C's watershed anchors (nsp5_f2c.py; needs --res_alloc f2c)")
     ap.add_argument("--power", type=float, default=3.0, help="its: BOLT's exponent")
     ap.add_argument("--nms_radius", type=float, default=10.0,
                     help="topk_nms: chosen seconds lie at least this far apart (Study X5)")
@@ -534,13 +535,40 @@ def main() -> None:
                     help="answer-model input: the frames as one video (default), or as separate "
                          "images, each after its time as text, which lets each frame have its own "
                          "resolution (Study AA)")
-    ap.add_argument("--res_alloc", choices=["none", "gmm"], default="none",
+    ap.add_argument("--res_alloc", choices=["none", "gmm", "f2c"], default="none",
                     help="--input images: visual tokens per frame, equal shares of the budget "
                          "(none) or GMM-EVA's primary and secondary tiers on this arm's own score "
-                         "curve (gmm; nsp5_gmm_eva.py, needs <curves>_gmm.npz)")
+                         "curve (gmm; nsp5_gmm_eva.py, needs <curves>_gmm.npz), or F2C's key clips "
+                         "on this arm's own score curve (f2c; nsp5_f2c.py): each anchor grows into "
+                         "a clip of l frames, each with 1/l of a full frame's tokens. The anchors are "
+                         "F2C's (--alloc f2c) or, the host variant, the runs of adjacent seconds this "
+                         "placement fills, each with as many full frames of budget as it holds frames")
     ap.add_argument("--res_ratio", type=float, default=4.0,
                     help="--res_alloc gmm: tokens of a primary frame over a secondary one "
                          "(GMM-EVA's 256 : 64)")
+    ap.add_argument("--f2c_anchors", type=int, default=0,
+                    help="--alloc f2c: K_anchor (0: K_anchor = K, the frame budget; F2C's App. D.3)")
+    ap.add_argument("--f2c_smax", type=float, default=2.0,
+                    help="--res_alloc f2c: s_max, the largest downscaling per side (App. D.3)")
+    ap.add_argument("--f2c_lam_r", type=float, default=0.5,
+                    help="--res_alloc f2c: lambda_r, weight of redundancy in Eq. 8 (App. D.3)")
+    ap.add_argument("--f2c_lam_l", type=float, default=0.05,
+                    help="--res_alloc f2c: lambda_l, weight of the temporal reward in Eq. 8 (App. D.3)")
+    ap.add_argument("--f2c_scale", type=float, default=100.0,
+                    help="--res_alloc f2c: curve units per cosine (the Qwen3-VL-Embedding curves "
+                         "are 100 x cosine); F2C's terms are cosines")
+    ap.add_argument("--f2c_emb", default="",
+                    help="--res_alloc f2c: npz of per-second frame embeddings keyed by video, for "
+                         "Eq. 7 (default: <bench>_img.npz beside --curves, prior_encode.py's cache)")
+    ap.add_argument("--f2c_native", action="store_true",
+                    help="--res_alloc f2c: a full frame is the video's own frame at --min_pixels and "
+                         "--max_pixels (F2C's setting: K frames at the original resolution), not "
+                         "the budget over K")
+    ap.add_argument("--f2c_round", choices=["nearest", "floor"], default="nearest",
+                    help="--res_alloc f2c: frames to the 28-pixel grid by rounding to the nearest "
+                         "size, as Qwen's processor does with F2C's downscaled frames, rounding "
+                         "down where the total would pass the budget (nearest), or always rounding "
+                         "down, as the other image arms do (floor); nsp5_f2c.grid_sizes")
     ap.add_argument("--dose_k", type=int, default=-1,
                     help="--arm dose: frames placed inside the annotated evidence (Study V)")
     ap.add_argument("--dose_margin", type=float, default=30.0,
@@ -673,6 +701,23 @@ def main() -> None:
 
     if args.res_alloc != "none" and (args.input != "images" or args.arm != "curve"):
         raise SystemExit("--res_alloc needs --input images and --arm curve")
+    if args.alloc == "f2c" and args.res_alloc != "f2c":
+        raise SystemExit("--alloc f2c places key clips with their own resolutions: "
+                         "it needs --res_alloc f2c")
+    if args.f2c_native and args.res_alloc != "f2c":
+        raise SystemExit("--f2c_native needs --res_alloc f2c")
+    f2c_emb_path = ""
+    if args.res_alloc == "f2c":               # F2C's Eq. 7 needs the scorer's frame embeddings
+        img_bench = {"cgbench_fresh": "cgbench"}.get(args.bench, args.bench)
+        f2c_emb_path = args.f2c_emb or os.path.join(os.path.dirname(args.curves),
+                                                    f"{img_bench}_img.npz")
+        if not os.path.exists(f2c_emb_path):
+            raise SystemExit(f"--res_alloc f2c: no frame embeddings at {f2c_emb_path}")
+        print(f"F2C: anchors {'F2C watershed' if args.alloc == 'f2c' else args.alloc + ' (host)'}, "
+              f"K_anchor {args.f2c_anchors or 'K'}, s_max {args.f2c_smax}, lam_r {args.f2c_lam_r}, "
+              f"lam_l {args.f2c_lam_l}, cosine = curve / {args.f2c_scale}, full frame "
+              f"{'native' if args.f2c_native else 'budget / K'}, embeddings {f2c_emb_path}",
+              flush=True)
     curves, curve_of, gmm = None, {}, None
     if args.arm == "curve":
         import numpy as np
@@ -795,7 +840,7 @@ def main() -> None:
             realized.append(abs(min(dur, center + args.offpeak_shift) - center))
         if args.arm == "dose":
             times = dose_times(item["spans"], dur, n, args.dose_k, args.dose_margin)
-        if args.arm == "curve":
+        if args.arm == "curve" and args.alloc != "f2c":
             times = curve_times(curves[curve_of[key]], dur, n, args.alloc,
                                 args.tau, args.eps, power=args.power,
                                 aks=(args.aks_t1, args.aks_t2, args.aks_depth),
@@ -803,13 +848,37 @@ def main() -> None:
                                 seed=zlib.crc32(f"{args.seed}:{key}".encode()),
                                 candidates=args.qframe_candidates, stack=args.stack,
                                 nms_radius=args.nms_radius, clip_len=args.clip_len)
-        idx = (times_to_indices_nearest if args.refill == "nearest" else times_to_indices)(
-            times, native_fps, total, n)
-        # frames the budget refill supplied: times that fell on an already-taken source
-        # frame, plus any shortfall (from the start of the video, or with --refill nearest
-        # from the nearest unused frames)
-        n_refill = (n - len({min(total - 1, max(0, round(t * native_fps))) for t in times})
-                    if args.arm == "curve" else None)
+        f2c_scales, f2c_fields = None, None
+        if args.res_alloc == "f2c":
+            # F2C's key clips (nsp5_f2c.py) on this arm's own curve, around F2C's anchors (--alloc
+            # f2c) or around the runs of seconds this placement fills (the host variant). Each
+            # frame is read at the start of its second, each second once, and nothing is refilled.
+            import numpy as np
+            import nsp5_f2c as f2c
+            z = np.asarray(curves[curve_of[key]], dtype=np.float64)[:max(1, int(np.ceil(dur)))]
+            if getattr(local, "f2c_vid", None) != item["key"]:
+                if not hasattr(local, "f2c_npz"):
+                    local.f2c_npz = np.load(f2c_emb_path)
+                local.f2c_vid, local.f2c_emb = item["key"], local.f2c_npz[item["key"]]
+            clips, n_anchors = f2c.select(z / args.f2c_scale, local.f2c_emb, n,
+                                          k_anchor=args.f2c_anchors,
+                                          placed=None if args.alloc == "f2c" else times,
+                                          s_max=args.f2c_smax, lam_r=args.f2c_lam_r,
+                                          lam_l=args.f2c_lam_l, seed=args.seed)
+            secs, f2c_scales = f2c.frame_plan(clips)
+            idx = [min(total - 1, max(0, round(t * native_fps))) for t in secs]
+            n_refill = None
+            f2c_fields = {"n_anchors": n_anchors,
+                          "f2c_clips": [[c.start, c.frames, c.length, round(c.budget, 3)]
+                                        for c in clips]}
+        else:
+            idx = (times_to_indices_nearest if args.refill == "nearest" else times_to_indices)(
+                times, native_fps, total, n)
+            # frames the budget refill supplied: times that fell on an already-taken source
+            # frame, plus any shortfall (from the start of the video, or with --refill nearest
+            # from the nearest unused frames)
+            n_refill = (n - len({min(total - 1, max(0, round(t * native_fps))) for t in times})
+                        if args.arm == "curve" else None)
         if vr_memo.get("path") != item["video_path"]:   # one reader per video
             vr_memo.update(path=item["video_path"],
                            vr=VideoReader(item["video_path"], num_threads=args.cpu_threads))
@@ -851,21 +920,32 @@ def main() -> None:
                 ck = curve_of[key]
                 tier = gmm_eva.tiers(ftimes, curves[ck], gmm[ck])
                 shares = gmm_eva.token_shares(tier, budget, args.res_ratio)
+            elif args.res_alloc == "f2c":
+                # 1 / s*^2 of a full frame each: the budget over K, or the video's own frame
+                tier = np.zeros(len(idx), int)
+                full = (f2c.native_tokens(int(frames.shape[2]), int(frames.shape[3]),
+                                          args.min_pixels, args.max_pixels)
+                        if args.f2c_native else budget / n)
+                shares = full * np.asarray(f2c_scales)
             else:
                 tier = np.zeros(len(idx), int)
                 shares = gmm_eva.token_shares(tier, budget, 1.0)
             H0, W0 = int(frames.shape[2]), int(frames.shape[3])
+            sizes = (f2c.grid_sizes(H0, W0, shares, full * n, args.f2c_round)
+                     if args.res_alloc == "f2c" else None)
             images = []
-            for f, tok in zip(frames, shares):
-                h, w = _qwen_vision.smart_resize(H0, W0, factor=28, min_pixels=4 * 28 * 28,
-                                                 max_pixels=max(int(tok * 28 * 28), 4 * 28 * 28))
+            for j, (f, tok) in enumerate(zip(frames, shares)):
+                h, w = sizes[j] if sizes else _qwen_vision.smart_resize(
+                    H0, W0, factor=28, min_pixels=4 * 28 * 28,
+                    max_pixels=max(int(tok * 28 * 28), 4 * 28 * 28))
                 img = torch.nn.functional.interpolate(f[None].float(), size=(h, w), mode="bicubic",
                                                       align_corners=False, antialias=True)
                 images.append(Image.fromarray(img.clamp(0, 255).to(torch.uint8)[0]
                                               .permute(1, 2, 0).numpy()))
             return {"center": center, "prior_err": prior_err, "dur": dur, "idx": idx,
                     "n_refill": n_refill, "native_fps": native_fps, "frames": None, "vmeta": None,
-                    "images": images, "ftimes": ftimes, "n_primary": int(tier.sum())}
+                    "images": images, "ftimes": ftimes, "n_primary": int(tier.sum()),
+                    "f2c": f2c_fields}
         frames = torch.nn.functional.interpolate(
             frames.float(), size=(H, W), mode="bicubic",
             align_corners=False, antialias=True).clamp(0, 255).to(ref_tensor.dtype)
@@ -913,6 +993,8 @@ def main() -> None:
                     image_fields = {"input": "images", "res_alloc": args.res_alloc,
                                     "n_primary": r["n_primary"],
                                     "visual_tokens": int(inputs["image_grid_thw"].prod(-1).sum()) // 4}
+                    if r.get("f2c"):                 # F2C: anchors and [start, frames, l, budget]
+                        image_fields.update(r["f2c"])
                     messages = None
                 else:
                     messages = [{"role": "user", "content": [
