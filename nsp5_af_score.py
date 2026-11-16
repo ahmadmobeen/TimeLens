@@ -6,14 +6,20 @@ within each benchmark, 5,000 draws, seed 0 (nsp5_pooled.pooled).
     descriptive    F2C minus GMM-EVA's selection under image input (LVBench, Video-MME, CG-Bench);
                    the host variant minus F2C (LVBench, CG-Bench)
 
+And Study AI (registered 8e1d202b), once nsp5_f2c_fill.py has spliced f2c_fill on every benchmark:
+
+    AI1 (primary)  aa_cal_img minus f2c_fill (F2C with the budget its clips leave unspent filled), pooled
+    descriptive    f2c_fill minus f2c_full; the share of the visual-token budget each arm spends
+
     .venv/bin/python nsp5_af_score.py          # from research/TimeLens
 """
+import json
 import os
 
 from nsp5_pooled import BENCH, SIZE, load, path
 from nsp5_wave1_score import show
 
-CAL, F2C, GMM_SEL, HOST = "aa_cal_img", "f2c_full", "aa_gmmeva_sel_img", "f2c_host_cal"
+CAL, F2C, GMM_SEL, HOST, FILL = "aa_cal_img", "f2c_full", "aa_gmmeva_sel_img", "f2c_host_cal", "f2c_fill"
 AA_BENCH = ("lvbench", "videomme", "cgbench")
 HOST_BENCH = ("lvbench", "cgbench")
 
@@ -41,6 +47,30 @@ def main() -> None:
         show("host - F2C", HOST, F2C, HOST_BENCH)
     else:
         print("(an arm is incomplete: the registered tests need every arm merged)")
+    study_ai()
+
+
+def budget_share(arm: str, bench: str) -> float:
+    """Mean share of the 14,336-token budget the arm's frames hold."""
+    with open(path(arm, bench), encoding="utf-8") as fh:
+        rows = [json.loads(line) for line in fh if line.strip()]
+    return sum(r["visual_tokens"] for r in rows) / (14336 * len(rows))
+
+
+def study_ai() -> None:
+    """Study AI (registered 8e1d202b): F2C with the budget its clips leave unspent filled (nsp5_f2c_fill.py)."""
+    missing = [b for b in BENCH if not os.path.exists(path(FILL, b)) or len(load(path(FILL, b))) != SIZE[b]]
+    if missing:
+        print(f"== Study AI: f2c_fill not spliced yet on {', '.join(missing)}")
+        return
+    print("== AI1 (primary): CaliFrame minus F2C with the fill, image input for both, five benchmarks")
+    show("AI1", CAL, FILL, BENCH)
+    print("== descriptive: F2C with the fill minus F2C as written")
+    show("fill - F2C", FILL, F2C, BENCH)
+    print("== descriptive: share of the visual-token budget spent")
+    for b in BENCH:
+        print(f"    {b:<9} F2C {budget_share(F2C, b):6.1%}  with the fill {budget_share(FILL, b):6.1%}  "
+              f"CaliFrame {budget_share(CAL, b):6.1%}")
 
 
 if __name__ == "__main__":
