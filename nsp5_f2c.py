@@ -279,6 +279,29 @@ def frame_plan(clips: list[Clip]) -> tuple[list[int], list[float]]:
     return secs, [best[t] for t in secs]
 
 
+def uniform_fill(idx, scales, K: int, dur: float, fps: float, total: int) -> tuple[list[int], list[float], int]:
+    """NS-P5's fill (Study AI, not in the paper): the budget F2C's clips leave unspent becomes
+    m = floor(K - sum(scales)) full frames at the uniform arm's times dur (i + 0.5) / m, each on the
+    nearest source frame not already taken (the later one on a tie, as times_to_indices_nearest does).
+    With fewer anchors than K_anchor, F2C's clips spend only their anchors' share of the budget; the
+    fill gives F2C the same visual-token budget as every other selector. Returns (frame indices,
+    scales, m) in time order; m = 0 leaves F2C's frames untouched."""
+    m = int(math.floor(K - float(np.sum(scales)) + EPS))
+    if m < 1:
+        return list(idx), list(scales), 0
+    taken = set(int(i) for i in idx)
+    plan = list(zip((int(i) for i in idx), scales))
+    for i in range(m):
+        w = min(total - 1, max(0, round(dur * (i + 0.5) / m * fps)))
+        c = next((x for d in range(total) for x in (w + d, w - d) if 0 <= x < total and x not in taken), None)
+        if c is None:
+            break
+        taken.add(c)
+        plan.append((c, 1.0))
+    plan.sort()
+    return [i for i, _ in plan], [float(s) for _, s in plan], m
+
+
 def native_tokens(h: int, w: int, min_pixels: int, max_pixels: int) -> float:
     """Visual tokens of a full frame at the video's own resolution: Qwen's smart_resize at the given
     pixel limits (max_pixels 0: the Qwen2.5-VL processor's 16,384-token cap)."""

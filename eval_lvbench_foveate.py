@@ -569,6 +569,10 @@ def main() -> None:
                          "size, as Qwen's processor does with F2C's downscaled frames, rounding "
                          "down where the total would pass the budget (nearest), or always rounding "
                          "down, as the other image arms do (floor); nsp5_f2c.grid_sizes")
+    ap.add_argument("--f2c_fill", choices=["none", "uniform"], default="none",
+                    help="--res_alloc f2c: the budget F2C's clips leave unspent (fewer anchors than "
+                         "K_anchor) stays unspent (none, F2C as written) or becomes full frames at the "
+                         "uniform arm's times (uniform; Study AI, nsp5_f2c.uniform_fill)")
     ap.add_argument("--dose_k", type=int, default=-1,
                     help="--arm dose: frames placed inside the annotated evidence (Study V)")
     ap.add_argument("--dose_margin", type=float, default=30.0,
@@ -871,6 +875,9 @@ def main() -> None:
             f2c_fields = {"n_anchors": n_anchors,
                           "f2c_clips": [[c.start, c.frames, c.length, round(c.budget, 3)]
                                         for c in clips]}
+            if args.f2c_fill == "uniform":
+                idx, f2c_scales, n_fill = f2c.uniform_fill(idx, f2c_scales, n, dur, native_fps, total)
+                f2c_fields["f2c_fill"] = n_fill
         else:
             idx = (times_to_indices_nearest if args.refill == "nearest" else times_to_indices)(
                 times, native_fps, total, n)
