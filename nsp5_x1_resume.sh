@@ -17,7 +17,7 @@ cd "$(dirname "$(readlink -f "$0")")"
 L=logs/nsp5
 DRY=0; [ "${2:-}" = "--dry-run" ] && DRY=1
 Q3=Qwen/Qwen3-VL-8B-Instruct
-declare -A TOTAL=([videomme]=2700 [lvb]=1337 [mlvu]=2174 [cgbench]=3000 [lvbench]=1534)
+declare -A TOTAL=([videomme]=2700 [lvb]=1337 [mlvu]=2174 [cgbench]=3000 [lvbench]=1534 [cgbench_fresh]=8256)
 # the same-video placebo skips CG-Bench's 317 single-question videos (no partner question)
 declare -A ARM_TOTAL=([x1_cgbench_a3_kelly_placebo]=2683 [x1_cgbench_q8_kelly_placebo]=2683
                       [x1_cgbench_q8_kelly_eps0_placebo]=2683 [x1_cgbench_q8_kelly_eps010_placebo]=2683
@@ -218,6 +218,19 @@ arms() {  # name|bench|venv|prerequisite curves|eval args
   echo "g2_q35_uniform|lvbench|.venv-q35||--arm uniform --model Qwen/Qwen3.5-4B"
   echo "g2_q35_b1|lvbench|.venv-q35||--arm topk_siglip --model Qwen/Qwen3.5-4B"
   echo "g2_q35_a3_kelly|lvbench|.venv-q35|data/t1/curves/fused_siglip_q8b_maxopt.npz|--arm curve --curves data/t1/curves/fused_siglip_q8b_maxopt.npz --alloc kelly --tau 1.76 --eps 0.5 --model Qwen/Qwen3.5-4B"
+  # Study AK (2026-11-18, descriptive): GMM-EVA in full (frames as images, its per-frame tiers at 4 : 1)
+  # on CG-Bench's 8,256 other questions at 64 frames (AK1), and at 32 frames on LVBench and Video-MME
+  # under three total budgets (AK2): 4,032, 8,192 (32 x 256, GMM-EVA's reference) and 14,336 tokens.
+  local ccf=data/t1/priors/qwen3vl_emb_8b/cgbench_fresh_curves_concat.npz
+  echo "x1_cgbench_fresh_aa_gmmeva_full|cgbench_fresh|.venv|${ccf%.npz}_gmm.npz|--arm curve --curves $ccf --alloc topk --refill nearest --topk_short uniform --input images --res_alloc gmm"
+  local bt cc
+  for bt in 4032 8192 14336; do
+    for b in lvbench videomme; do
+      pre=""; tag=""; [ $b != lvbench ] && { pre="x1_${b}_"; tag="${b}_"; }
+      cc=data/t1/priors/qwen3vl_emb_8b/${tag}curves_concat.npz
+      echo "${pre}ak32_t${bt}_gmmeva_full|$b|.venv|${cc%.npz}_gmm.npz|--arm curve --curves $cc --alloc topk --refill nearest --topk_short uniform --input images --res_alloc gmm --n_frames 32 --total_pixels $((bt * 784))"
+    done
+  done
 }
 
 rows() { if [ -f "$L/$1.jsonl" ]; then wc -l < "$L/$1.jsonl"; else echo 0; fi; }
